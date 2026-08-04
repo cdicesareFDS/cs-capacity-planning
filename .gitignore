@@ -1,0 +1,11 @@
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.DS_Store
+*.csv
+.venv/
+venv/
+.streamlit/credentials.toml
+.streamlit/machine_id_v4
