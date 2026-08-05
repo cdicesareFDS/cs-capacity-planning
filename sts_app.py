@@ -47,11 +47,22 @@ def capacity_status(hours_per_week, group_average, variance_pct):
 @st.cache_resource
 def get_databricks_connection():
     """Create a persistent Databricks connection"""
-    return connect(
-        server_hostname=st.secrets.get("DATABRICKS_HOST"),
-        http_path=st.secrets.get("DATABRICKS_HTTP_PATH"),
-        auth_type="oauth"
-    )
+    try:
+        # In Databricks App: use WorkspaceClient auto-detection with known warehouse
+        from databricks.sdk import WorkspaceClient
+        client = WorkspaceClient()
+        host = client.config.host.replace("https://", "").replace("/", "")
+        return connect(
+            server_hostname=host,
+            http_path="/sql/1.0/warehouses/5534359f9aac6560"
+        )
+    except:
+        # Fallback: local dev with OAuth
+        return connect(
+            server_hostname=st.secrets.get("DATABRICKS_HOST"),
+            http_path=st.secrets.get("DATABRICKS_HTTP_PATH"),
+            auth_type="oauth"
+        )
 
 @st.cache_data
 def load_trend_data(fy_start, fy_end, granularity="month"):
