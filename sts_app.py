@@ -47,33 +47,27 @@ def capacity_status(hours_per_week, group_average, variance_pct):
 @st.cache_resource
 def get_databricks_connection():
     """Create a persistent Databricks connection"""
-    import os
-    import sys
-
     try:
         # Try local dev first with OAuth
-        try:
-            host = st.secrets.get("DATABRICKS_HOST")
-            http_path = st.secrets.get("DATABRICKS_HTTP_PATH")
-            if host and http_path:
-                return connect(
-                    server_hostname=host,
-                    http_path=http_path,
-                    auth_type="oauth"
-                )
-        except Exception as e:
-            print(f"OAuth attempt failed: {e}", file=sys.stderr)
+        host = st.secrets.get("DATABRICKS_HOST")
+        http_path = st.secrets.get("DATABRICKS_HTTP_PATH")
+        if host and http_path:
+            return connect(
+                server_hostname=host,
+                http_path=http_path,
+                auth_type="oauth"
+            )
+    except Exception as e:
+        pass
 
-        # Databricks App fallback: hardcoded values
+    # Databricks App: let connector auto-detect workspace credentials
+    try:
         return connect(
             server_hostname="dbc-28da8a59-87b8.cloud.databricks.com",
-            http_path="/sql/1.0/warehouses/5534359f9aac6560",
-            auth_type="pat",
-            token=os.environ.get("DATABRICKS_TOKEN", "")
+            http_path="/sql/1.0/warehouses/5534359f9aac6560"
         )
     except Exception as e:
-        print(f"Connection failed: {e}", file=sys.stderr)
-        raise
+        raise Exception(f"Failed to connect to Databricks: {e}")
 
 @st.cache_data
 def load_trend_data(fy_start, fy_end, granularity="month"):
