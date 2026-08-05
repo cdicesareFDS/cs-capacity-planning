@@ -48,23 +48,28 @@ def capacity_status(hours_per_week, group_average, variance_pct):
 def get_databricks_connection():
     """Create a persistent Databricks connection"""
     try:
-        # Try local dev first with OAuth
-        host = st.secrets.get("DATABRICKS_HOST")
-        http_path = st.secrets.get("DATABRICKS_HTTP_PATH")
-        if host and http_path:
-            return connect(
-                server_hostname=host,
-                http_path=http_path,
-                auth_type="oauth"
-            )
+        # Try Databricks App first: use WorkspaceClient to get credentials
+        from databricks.sdk import WorkspaceClient
+        client = WorkspaceClient()
+
+        # Get workspace config
+        cfg = client.config
+        return connect(
+            server_hostname=cfg.host.replace("https://", ""),
+            http_path="/sql/1.0/warehouses/5534359f9aac6560",
+            access_token=cfg.token
+        )
     except Exception as e:
         pass
 
-    # Databricks App: let connector auto-detect workspace credentials
+    # Fallback: local dev with OAuth
     try:
+        host = st.secrets.get("DATABRICKS_HOST")
+        http_path = st.secrets.get("DATABRICKS_HTTP_PATH")
         return connect(
-            server_hostname="dbc-28da8a59-87b8.cloud.databricks.com",
-            http_path="/sql/1.0/warehouses/5534359f9aac6560"
+            server_hostname=host,
+            http_path=http_path,
+            auth_type="oauth"
         )
     except Exception as e:
         raise Exception(f"Failed to connect to Databricks: {e}")
