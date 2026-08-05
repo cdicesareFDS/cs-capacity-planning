@@ -48,22 +48,32 @@ def capacity_status(hours_per_week, group_average, variance_pct):
 def get_databricks_connection():
     """Create a persistent Databricks connection"""
     import os
+    import sys
 
-    # Check if running in Databricks App (env vars are set by Databricks)
-    if "DATABRICKS_HOST" in os.environ and "DATABRICKS_TOKEN" in os.environ:
-        # Databricks App: use environment variables set by runtime
+    try:
+        # Try local dev first with OAuth
+        try:
+            host = st.secrets.get("DATABRICKS_HOST")
+            http_path = st.secrets.get("DATABRICKS_HTTP_PATH")
+            if host and http_path:
+                return connect(
+                    server_hostname=host,
+                    http_path=http_path,
+                    auth_type="oauth"
+                )
+        except Exception as e:
+            print(f"OAuth attempt failed: {e}", file=sys.stderr)
+
+        # Databricks App fallback: hardcoded values
         return connect(
-            server_hostname=os.environ["DATABRICKS_HOST"],
+            server_hostname="dbc-28da8a59-87b8.cloud.databricks.com",
             http_path="/sql/1.0/warehouses/5534359f9aac6560",
-            access_token=os.environ["DATABRICKS_TOKEN"]
+            auth_type="pat",
+            token=os.environ.get("DATABRICKS_TOKEN", "")
         )
-    else:
-        # Local dev: use OAuth with secrets
-        return connect(
-            server_hostname=st.secrets.get("DATABRICKS_HOST"),
-            http_path=st.secrets.get("DATABRICKS_HTTP_PATH"),
-            auth_type="oauth"
-        )
+    except Exception as e:
+        print(f"Connection failed: {e}", file=sys.stderr)
+        raise
 
 @st.cache_data
 def load_trend_data(fy_start, fy_end, granularity="month"):
