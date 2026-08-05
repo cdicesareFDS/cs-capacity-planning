@@ -155,9 +155,13 @@ def load_trend_data(fy_start, fy_end, granularity="month"):
 @st.cache_data
 def load_data(fy_start, fy_end):
     """Query Databricks for combined metrics"""
+    import sys
     try:
+        print(f"[load_data] Connecting to Databricks...", file=sys.stderr)
         conn = get_databricks_connection()
+        print(f"[load_data] Connected! Getting cursor...", file=sys.stderr)
         cursor = conn.cursor()
+        print(f"[load_data] Cursor acquired, executing query...", file=sys.stderr)
 
         # Calculate business days and weeks (from notebook)
         from pandas.tseries.holiday import USFederalHolidayCalendar
@@ -421,13 +425,19 @@ def load_data(fy_start, fy_end):
             ORDER BY fe.Department, COALESCE(c.TotalCases, 0) DESC
         """
 
+        print(f"[load_data] Executing query...", file=sys.stderr)
         cursor.execute(query)
+        print(f"[load_data] Query executed, fetching results...", file=sys.stderr)
         df = cursor.fetchall_arrow().to_pandas()
+        print(f"[load_data] Results fetched: {len(df)} rows", file=sys.stderr)
         cursor.close()
 
         return df
     except Exception as e:
-        st.error(f"Error loading data from Databricks: {e}")
+        import traceback
+        error_msg = f"Error loading data: {str(e)}\n{traceback.format_exc()}"
+        print(error_msg, file=sys.stderr)
+        st.error(error_msg)
         return None
 
 # ============================================================================
