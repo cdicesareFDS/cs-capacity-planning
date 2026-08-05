@@ -7,3 +7,6 @@ font = "sans serif"
 
 [client]
 showErrorDetails = true
+
+[browser]
+gatherUsageStats = false
