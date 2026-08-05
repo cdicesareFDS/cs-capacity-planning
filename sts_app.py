@@ -50,7 +50,7 @@ def get_databricks_connection():
     return connect(
         server_hostname=st.secrets.get("DATABRICKS_HOST"),
         http_path=st.secrets.get("DATABRICKS_HTTP_PATH"),
-        access_token=st.secrets.get("DATABRICKS_TOKEN")
+        auth_type="oauth"
     )
 
 @st.cache_data
