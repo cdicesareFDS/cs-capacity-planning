@@ -50,21 +50,29 @@ def get_databricks_connection():
     import sys
     import os
 
-    # Try Databricks App first: use WorkspaceClient to get host, connector uses default auth
+    # Try Databricks App first: use WorkspaceClient + SDK's built-in SQL
     try:
         from databricks.sdk import WorkspaceClient
-        print("[get_databricks_connection] Trying WorkspaceClient...", file=sys.stderr)
+        from databricks import sql
+        print("[get_databricks_connection] Trying Databricks SDK SQL...", file=sys.stderr)
         client = WorkspaceClient()
+
+        # Use the SDK's SQL connection method which handles auth automatically
+        conn = client.dbfs.get_status("dbfs:/")  # Test if we can auth
+        print(f"[get_databricks_connection] Auth successful!", file=sys.stderr)
+
+        # Now use databricks.sql with the client's config
         cfg = client.config
         host = cfg.host.replace("https://", "")
-        print(f"[get_databricks_connection] WorkspaceClient got host: {host}", file=sys.stderr)
-        # Don't pass token explicitly - let connector use default auth chain
-        return connect(
+        print(f"[get_databricks_connection] Connecting to {host}...", file=sys.stderr)
+
+        return sql.connect(
             server_hostname=host,
-            http_path="/sql/1.0/warehouses/5534359f9aac6560"
+            http_path="/sql/1.0/warehouses/5534359f9aac6560",
+            auth_type="databricks-cli"
         )
     except Exception as e:
-        print(f"[get_databricks_connection] WorkspaceClient failed: {e}", file=sys.stderr)
+        print(f"[get_databricks_connection] Databricks SDK SQL failed: {e}", file=sys.stderr)
 
     # Fallback: local dev with OAuth (only if secrets exist)
     try:
