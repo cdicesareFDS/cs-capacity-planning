@@ -50,17 +50,18 @@ def get_databricks_connection():
     import sys
     import os
 
-    # Try Databricks App first: use WorkspaceClient to get credentials
+    # Try Databricks App first: use WorkspaceClient to get host, connector uses default auth
     try:
         from databricks.sdk import WorkspaceClient
         print("[get_databricks_connection] Trying WorkspaceClient...", file=sys.stderr)
         client = WorkspaceClient()
         cfg = client.config
-        print(f"[get_databricks_connection] WorkspaceClient success! Host: {cfg.host}", file=sys.stderr)
+        host = cfg.host.replace("https://", "")
+        print(f"[get_databricks_connection] WorkspaceClient got host: {host}", file=sys.stderr)
+        # Don't pass token explicitly - let connector use default auth chain
         return connect(
-            server_hostname=cfg.host.replace("https://", ""),
-            http_path="/sql/1.0/warehouses/5534359f9aac6560",
-            access_token=cfg.token
+            server_hostname=host,
+            http_path="/sql/1.0/warehouses/5534359f9aac6560"
         )
     except Exception as e:
         print(f"[get_databricks_connection] WorkspaceClient failed: {e}", file=sys.stderr)
