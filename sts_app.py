@@ -47,25 +47,34 @@ def capacity_status(hours_per_week, group_average, variance_pct):
 @st.cache_resource
 def get_databricks_connection():
     """Create a persistent Databricks connection"""
-    try:
-        # Try Databricks App first: use WorkspaceClient to get credentials
-        from databricks.sdk import WorkspaceClient
-        client = WorkspaceClient()
+    import sys
+    import os
 
-        # Get workspace config
+    # Try Databricks App first: use WorkspaceClient to get credentials
+    try:
+        from databricks.sdk import WorkspaceClient
+        print("[get_databricks_connection] Trying WorkspaceClient...", file=sys.stderr)
+        client = WorkspaceClient()
         cfg = client.config
+        print(f"[get_databricks_connection] WorkspaceClient success! Host: {cfg.host}", file=sys.stderr)
         return connect(
             server_hostname=cfg.host.replace("https://", ""),
             http_path="/sql/1.0/warehouses/5534359f9aac6560",
             access_token=cfg.token
         )
     except Exception as e:
-        pass
+        print(f"[get_databricks_connection] WorkspaceClient failed: {e}", file=sys.stderr)
 
-    # Fallback: local dev with OAuth
+    # Fallback: local dev with OAuth (only if secrets exist)
     try:
+        # Check if secrets file exists before accessing
+        secrets_path = os.path.expanduser("~/.streamlit/secrets.toml")
+        if not os.path.exists(secrets_path):
+            raise Exception("No secrets.toml found - running in Databricks App?")
+
         host = st.secrets.get("DATABRICKS_HOST")
         http_path = st.secrets.get("DATABRICKS_HTTP_PATH")
+        print(f"[get_databricks_connection] Using OAuth with host: {host}", file=sys.stderr)
         return connect(
             server_hostname=host,
             http_path=http_path,
