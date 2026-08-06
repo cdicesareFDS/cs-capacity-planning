@@ -54,27 +54,26 @@ def get_databricks_connection():
     try:
         from databricks.sdk import WorkspaceClient
         from databricks import sql
-        print("[get_databricks_connection] Trying Databricks SDK SQL...", file=sys.stderr)
-        client = WorkspaceClient()
+        print("[get_databricks_connection] Trying Databricks App auth...", file=sys.stderr)
 
-        # Test if we can auth
-        client.dbfs.get_status("dbfs:/")
-        print(f"[get_databricks_connection] WorkspaceClient auth successful!", file=sys.stderr)
+        w = WorkspaceClient()
 
-        # Extract host from WorkspaceClient's config
-        cfg = client.config
-        host = cfg.host.replace("https://", "") if cfg.host else None
-        print(f"[get_databricks_connection] Connecting to {host}...", file=sys.stderr)
+        # Create a credentials provider that uses WorkspaceClient's auth
+        def credential_provider():
+            headers = {}
+            w.config.authenticate(headers)
+            return headers
 
-        # Use sql.connect without specifying auth type - let SDK use the app's service principal
-        # The WorkspaceClient already authenticated, so the environment is set up correctly
+        print(f"[get_databricks_connection] Connecting to {w.config.host}...", file=sys.stderr)
+
         return sql.connect(
-            server_hostname=host,
-            http_path="/sql/1.0/warehouses/5534359f9aac6560"
+            server_hostname=w.config.host.replace("https://", ""),
+            http_path="/sql/1.0/warehouses/5534359f9aac6560",
+            credentials_provider=credential_provider,
         )
     except Exception as e:
         import traceback
-        print(f"[get_databricks_connection] Databricks SDK SQL failed: {e}", file=sys.stderr)
+        print(f"[get_databricks_connection] Databricks App auth failed: {e}", file=sys.stderr)
         print(f"[get_databricks_connection] Traceback: {traceback.format_exc()}", file=sys.stderr)
 
     # Fallback: local dev with OAuth (only if secrets exist)
