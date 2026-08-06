@@ -60,9 +60,7 @@ def get_databricks_connection():
 
         # Create a credentials provider that uses WorkspaceClient's auth
         def credential_provider():
-            headers = {}
-            w.config.authenticate(headers)
-            return headers
+            return w.config.authenticate()
 
         print(f"[get_databricks_connection] Connecting to {w.config.host}...", file=sys.stderr)
 
