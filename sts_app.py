@@ -50,26 +50,30 @@ def get_databricks_connection():
     import sys
     import os
 
-    # Try Databricks App first: use WorkspaceClient + SDK's built-in SQL
+    # Try Databricks App first: use WorkspaceClient + extract token for SQL
     try:
         from databricks.sdk import WorkspaceClient
         from databricks import sql
         print("[get_databricks_connection] Trying Databricks SDK SQL...", file=sys.stderr)
         client = WorkspaceClient()
 
-        # Use the SDK's SQL connection method which handles auth automatically
-        conn = client.dbfs.get_status("dbfs:/")  # Test if we can auth
-        print(f"[get_databricks_connection] Auth successful!", file=sys.stderr)
+        # Test if we can auth
+        client.dbfs.get_status("dbfs:/")
+        print(f"[get_databricks_connection] WorkspaceClient auth successful!", file=sys.stderr)
 
-        # Now use databricks.sql with the client's config
+        # Extract credentials from WorkspaceClient's config
         cfg = client.config
-        host = cfg.host.replace("https://", "")
+        host = cfg.host.replace("https://", "") if cfg.host else None
+        token = cfg.token
+        print(f"[get_databricks_connection] Extracted token: {token[:20] if token else 'None'}...", file=sys.stderr)
         print(f"[get_databricks_connection] Connecting to {host}...", file=sys.stderr)
 
+        # Use sql.connect with extracted token (PAT auth)
         return sql.connect(
             server_hostname=host,
             http_path="/sql/1.0/warehouses/5534359f9aac6560",
-            auth_type="databricks-cli"
+            auth_type="pat",
+            access_token=token
         )
     except Exception as e:
         print(f"[get_databricks_connection] Databricks SDK SQL failed: {e}", file=sys.stderr)
