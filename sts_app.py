@@ -64,19 +64,42 @@ def get_databricks_connection():
         # Extract credentials from WorkspaceClient's config
         cfg = client.config
         host = cfg.host.replace("https://", "") if cfg.host else None
-        token = cfg.token
-        print(f"[get_databricks_connection] Extracted token: {token[:20] if token else 'None'}...", file=sys.stderr)
+
+        # Try different ways to get the token
+        token = None
+        if hasattr(cfg, 'token'):
+            token = cfg.token
+            print(f"[get_databricks_connection] Got token from cfg.token", file=sys.stderr)
+        elif hasattr(cfg, 'access_token'):
+            token = cfg.access_token
+            print(f"[get_databricks_connection] Got token from cfg.access_token", file=sys.stderr)
+        else:
+            # Try to get from credential provider
+            cred_provider = cfg.auth_type
+            print(f"[get_databricks_connection] Config auth_type: {cred_provider}, available attrs: {dir(cfg)}", file=sys.stderr)
+
+        print(f"[get_databricks_connection] Token: {token[:20] if token else 'None'}...", file=sys.stderr)
         print(f"[get_databricks_connection] Connecting to {host}...", file=sys.stderr)
 
-        # Use sql.connect with extracted token (PAT auth)
-        return sql.connect(
-            server_hostname=host,
-            http_path="/sql/1.0/warehouses/5534359f9aac6560",
-            auth_type="pat",
-            access_token=token
-        )
+        if token:
+            return sql.connect(
+                server_hostname=host,
+                http_path="/sql/1.0/warehouses/5534359f9aac6560",
+                auth_type="pat",
+                access_token=token
+            )
+        else:
+            # Fallback: try without explicit token (let SDK handle it)
+            print(f"[get_databricks_connection] No token found, trying with default SDK auth...", file=sys.stderr)
+            return sql.connect(
+                server_hostname=host,
+                http_path="/sql/1.0/warehouses/5534359f9aac6560",
+                auth_type="oauth"
+            )
     except Exception as e:
+        import traceback
         print(f"[get_databricks_connection] Databricks SDK SQL failed: {e}", file=sys.stderr)
+        print(f"[get_databricks_connection] Traceback: {traceback.format_exc()}", file=sys.stderr)
 
     # Fallback: local dev with OAuth (only if secrets exist)
     try:
