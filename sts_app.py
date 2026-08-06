@@ -50,7 +50,7 @@ def get_databricks_connection():
     import sys
     import os
 
-    # Try Databricks App first: use WorkspaceClient + extract token for SQL
+    # Try Databricks App first: use WorkspaceClient's credentials for SQL
     try:
         from databricks.sdk import WorkspaceClient
         from databricks import sql
@@ -61,41 +61,17 @@ def get_databricks_connection():
         client.dbfs.get_status("dbfs:/")
         print(f"[get_databricks_connection] WorkspaceClient auth successful!", file=sys.stderr)
 
-        # Extract credentials from WorkspaceClient's config
+        # Extract host from WorkspaceClient's config
         cfg = client.config
         host = cfg.host.replace("https://", "") if cfg.host else None
-
-        # Try different ways to get the token
-        token = None
-        if hasattr(cfg, 'token'):
-            token = cfg.token
-            print(f"[get_databricks_connection] Got token from cfg.token", file=sys.stderr)
-        elif hasattr(cfg, 'access_token'):
-            token = cfg.access_token
-            print(f"[get_databricks_connection] Got token from cfg.access_token", file=sys.stderr)
-        else:
-            # Try to get from credential provider
-            cred_provider = cfg.auth_type
-            print(f"[get_databricks_connection] Config auth_type: {cred_provider}, available attrs: {dir(cfg)}", file=sys.stderr)
-
-        print(f"[get_databricks_connection] Token: {token[:20] if token else 'None'}...", file=sys.stderr)
         print(f"[get_databricks_connection] Connecting to {host}...", file=sys.stderr)
 
-        if token:
-            return sql.connect(
-                server_hostname=host,
-                http_path="/sql/1.0/warehouses/5534359f9aac6560",
-                auth_type="pat",
-                access_token=token
-            )
-        else:
-            # Fallback: try without explicit token (let SDK handle it)
-            print(f"[get_databricks_connection] No token found, trying with default SDK auth...", file=sys.stderr)
-            return sql.connect(
-                server_hostname=host,
-                http_path="/sql/1.0/warehouses/5534359f9aac6560",
-                auth_type="oauth"
-            )
+        # Use sql.connect without specifying auth type - let SDK use the app's service principal
+        # The WorkspaceClient already authenticated, so the environment is set up correctly
+        return sql.connect(
+            server_hostname=host,
+            http_path="/sql/1.0/warehouses/5534359f9aac6560"
+        )
     except Exception as e:
         import traceback
         print(f"[get_databricks_connection] Databricks SDK SQL failed: {e}", file=sys.stderr)
