@@ -5,6 +5,7 @@ import plotly.express as px
 from datetime import datetime, timedelta, date as _date
 import numpy as np
 from databricks.sql import connect
+from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 
 st.set_page_config(page_title="Workforce Analytics", layout="wide", initial_sidebar_state="expanded")
 
@@ -113,6 +114,19 @@ def load_trend_data(fy_start, fy_end, granularity="month"):
               FROM ea_prod.reference_gold.employee
               WHERE JobFamily = 'Client Consulting' AND Active = 1
             ),
+            dept_region AS (
+              SELECT DISTINCT
+                fe.Department,
+                CASE
+                  WHEN dh.Region = 'Americas' THEN 'Americas'
+                  WHEN dh.Region = 'Europe' THEN 'EMEA'
+                  WHEN dh.Region = 'Asia' THEN 'AsiaPac'
+                  ELSE COALESCE(dh.Region, 'Unknown')
+                END as Region
+              FROM filtered_employees fe
+              LEFT JOIN ea_prod.reference_gold.department_hierarchy dh
+                ON fe.Department = dh.Department AND dh.Current = true
+            ),
             case_trend AS (
               SELECT
                 DATE_TRUNC('{granularity}', c.OpenedDate) as Period,
@@ -151,10 +165,33 @@ def load_trend_data(fy_start, fy_end, granularity="month"):
               WHERE a.activity_date >= '{fy_start}' AND a.activity_date <= '{fy_end}'
                 AND a.activity_type IN ('Call', 'Email')
               GROUP BY DATE_TRUNC('{granularity}', a.activity_date), fe.Department
+            ),
+            rpd_authored_trend AS (
+              SELECT
+                DATE_TRUNC('{granularity}', ra.`Created Date`) as Period,
+                fe.Department,
+                COUNT(DISTINCT ra.`RPD#`) as RPDs_Authored
+              FROM ea_prod.reporting_gold.pbi_rpd ra
+              INNER JOIN filtered_employees fe ON TRY_CAST(ra.`Author ID` AS INT) = fe.EmployeeID
+              WHERE ra.`Created Date` >= '{fy_start}' AND ra.`Created Date` <= '{fy_end}'
+                AND TRY_CAST(ra.`Author ID` AS INT) IS NOT NULL
+              GROUP BY DATE_TRUNC('{granularity}', ra.`Created Date`), fe.Department
+            ),
+            rpd_comments_trend AS (
+              SELECT
+                DATE_TRUNC('{granularity}', TO_DATE(CAST(rc.CommentDateKey AS STRING), 'yyyyMMdd')) as Period,
+                fe.Department,
+                COUNT(*) as RPD_Comments
+              FROM ea_prod.rpdfacts_gold.f_tr_rpd_comments rc
+              INNER JOIN filtered_employees fe ON rc.CommenterId = fe.EmployeeID
+              WHERE rc.CommentDateKey >= REPLACE('{fy_start}', '-', '')
+                AND rc.CommentDateKey <= REPLACE('{fy_end}', '-', '')
+              GROUP BY DATE_TRUNC('{granularity}', TO_DATE(CAST(rc.CommentDateKey AS STRING), 'yyyyMMdd')), fe.Department
             )
             SELECT
-              COALESCE(c.Period, m.Period, e.Period) as Period,
-              COALESCE(c.Department, m.Department, e.Department) as Department,
+              COALESCE(c.Period, m.Period, e.Period, ra.Period, rc.Period) as Period,
+              COALESCE(c.Department, m.Department, e.Department, ra.Department, rc.Department) as Department,
+              dr.Region,
               COALESCE(c.TotalCases, 0) as TotalCases,
               COALESCE(c.CaseHours, 0) as CaseHours,
               COALESCE(m.UniqueMeetings, 0) as UniqueMeetings,
@@ -163,13 +200,21 @@ def load_trend_data(fy_start, fy_end, granularity="month"):
               COALESCE(e.CallHours, 0) as CallHours,
               COALESCE(e.EmailCount, 0) as EmailCount,
               COALESCE(e.EmailHours, 0) as EmailHours,
+              COALESCE(ra.RPDs_Authored, 0) as RPDs_Authored,
+              COALESCE(rc.RPD_Comments, 0) as RPD_Comments,
+              ROUND((COALESCE(ra.RPDs_Authored, 0) * 20.0 + COALESCE(rc.RPD_Comments, 0) * 10.0) / 60.0, 2) as RPDHours,
               ROUND(
                 COALESCE(c.CaseHours, 0) + COALESCE(m.MeetingHours, 0) +
-                COALESCE(e.CallHours, 0) + COALESCE(e.EmailHours, 0), 2
+                COALESCE(e.CallHours, 0) + COALESCE(e.EmailHours, 0) +
+                (COALESCE(ra.RPDs_Authored, 0) * 20.0 + COALESCE(rc.RPD_Comments, 0) * 10.0) / 60.0, 2
               ) as TotalHours
             FROM case_trend c
             FULL OUTER JOIN meeting_trend m ON c.Period = m.Period AND c.Department = m.Department
             FULL OUTER JOIN call_email_trend e ON c.Period = e.Period AND c.Department = e.Department
+            FULL OUTER JOIN rpd_authored_trend ra ON c.Period = ra.Period AND c.Department = ra.Department
+            FULL OUTER JOIN rpd_comments_trend rc ON c.Period = rc.Period AND c.Department = rc.Department
+            LEFT JOIN dept_region dr
+              ON COALESCE(c.Department, m.Department, e.Department, ra.Department, rc.Department) = dr.Department
             ORDER BY Period, Department
         """
 
@@ -384,6 +429,12 @@ def load_data(fy_start, fy_end):
               GROUP BY TRY_CAST(`Author ID` AS INT)
             )
             SELECT
+              CASE
+                WHEN dh_region.Region = 'Americas' THEN 'Americas'
+                WHEN dh_region.Region = 'Europe' THEN 'EMEA'
+                WHEN dh_region.Region = 'Asia' THEN 'AsiaPac'
+                ELSE COALESCE(dh_region.Region, 'Unknown')
+              END as Region,
               fe.Department,
               fe.FullName_FNF as EmployeeName,
               REPLACE(fe.JobTitle, ', Client Solutions', '') as JobTitle,
@@ -444,6 +495,8 @@ def load_data(fy_start, fy_end):
                 COALESCE(ce.CallTimeSpentHours, 0) + COALESCE(ce.EmailHours, 0) +
                 (COALESCE(ra.RPDs_Authored, 0) * 20.0 + COALESCE(rpd.RPD_Comments, 0) * 10.0) / 60.0, 0) * 100, 1) as RPDsPct
             FROM filtered_employees fe
+            LEFT JOIN ea_prod.reference_gold.department_hierarchy dh_region
+              ON fe.Department = dh_region.Department AND dh_region.Current = true
             LEFT JOIN ea_dev.reporting_gold.sl_employeedepartment_history hd
               ON fe.EmployeeID = hd.EmployeeId AND hd.Current = true
             LEFT JOIN case_metrics c        ON fe.FullName_FNF = c.CaseOwner
@@ -452,7 +505,7 @@ def load_data(fy_start, fy_end):
             LEFT JOIN call_email_metrics ce ON fe.FullName_FNF = ce.EmployeeName
             LEFT JOIN rpd_comments_agg rpd ON fe.EmployeeID = rpd.EmployeeId
             LEFT JOIN rpd_authored_agg ra  ON fe.EmployeeID = ra.AuthorId
-            ORDER BY fe.Department, COALESCE(c.TotalCases, 0) DESC
+            ORDER BY Region, fe.Department, COALESCE(c.TotalCases, 0) DESC
         """
 
         print(f"[load_data] Executing query...", file=sys.stderr)
@@ -502,19 +555,47 @@ df = load_data(fy_start, fy_end)
 if df is None:
     st.stop()
 
-# Get unique departments
-departments = sorted(df['Department'].unique().tolist())
+# Get unique regions and departments
+regions = sorted(df['Region'].unique().tolist())
+all_departments = sorted(df['Department'].unique().tolist())
 
-# Department filter
-selected_dept = st.sidebar.multiselect(
-    "Department(s)",
-    options=departments,
-    default=[]
+# Region filter
+st.sidebar.markdown("**Region**")
+selected_regions = st.sidebar.multiselect(
+    "Select region(s)",
+    options=regions,
+    default=[],
+    label_visibility="collapsed"
 )
 
-# Filter by selected departments
-if selected_dept:
-    filtered_df = df[df['Department'].isin(selected_dept)].copy()
+# Get departments in selected regions (or all if no region selected)
+if selected_regions:
+    depts_in_regions = sorted(df[df['Region'].isin(selected_regions)]['Department'].unique().tolist())
+    default_depts = depts_in_regions
+else:
+    depts_in_regions = all_departments
+    default_depts = []
+
+# Department filter
+st.sidebar.markdown("**Department(s)**")
+selected_dept = st.sidebar.multiselect(
+    "Select department(s)",
+    options=depts_in_regions,
+    default=default_depts,
+    label_visibility="collapsed"
+)
+
+# Reset button
+if st.sidebar.button("🔄 Reset Filters", use_container_width=True):
+    st.rerun()
+
+# Filter by selected regions and departments
+if selected_regions or selected_dept:
+    filtered_df = df.copy()
+    if selected_regions:
+        filtered_df = filtered_df[filtered_df['Region'].isin(selected_regions)]
+    if selected_dept:
+        filtered_df = filtered_df[filtered_df['Department'].isin(selected_dept)]
 else:
     filtered_df = df.copy()
 
@@ -550,7 +631,7 @@ over_count = capacity_counts.get('Over', 0)
 # TAB STRUCTURE
 # ============================================================================
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["Overview", "Team", "Individual", "Trends", "Data & Export"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["Overview", "Team", "Individual", "Trends", "Data & Export", "Methodology"])
 
 # ============================================================================
 # TAB 1: OVERVIEW
@@ -581,6 +662,8 @@ with tab1:
     with col5:
         with st.container(border=True):
             st.metric("Total Meetings", f"{total_meetings:,.0f}")
+
+    st.caption("ℹ️ Total Hours and Avg Hrs/Week include estimated time for Calls, Emails, and RPDs — see the Methodology tab for how each is calculated.")
 
     st.divider()
 
@@ -618,6 +701,7 @@ with tab1:
             key="activity_drill",
             label_visibility="collapsed"
         )
+    st.caption("ℹ️ Cases & Meetings hours are actual tracked time. Calls, Emails, and RPDs hours are estimates based on fixed time-per-activity assumptions — see the Methodology tab for details.")
 
     # Filter data for activity view
     if activity_drill_dept == "All Departments":
@@ -683,17 +767,30 @@ with tab1:
     activity_df['% of Total'] = (activity_df['Hours'] / total_hours * 100).round(1) if total_hours > 0 else 0
     activity_df = activity_df.sort_values('Hours', ascending=False)
 
+    activity_proxy_notes = {
+        'Cases': "Actual tracked time (TimeToResolutionHrs)",
+        'Meetings': "Actual tracked time (meeting duration)",
+        'Calls': "Estimate: 2 min/missed call + 5 min/connected call",
+        'Emails': "Estimate: 10 min per email",
+        'RPDs': "Estimate: 20 min/authored + 10 min/comment",
+    }
+
     metric_cols = st.columns(len(activity_df))
     for idx, (col, (_, row)) in enumerate(zip(metric_cols, activity_df.iterrows())):
         with col:
             with st.container(border=True):
-                st.metric(row['Activity'], f"{row['Hours']:,.0f}h")
+                st.metric(
+                    row['Activity'],
+                    f"{row['Hours']:,.0f}h",
+                    help=activity_proxy_notes.get(row['Activity'], '')
+                )
                 st.caption(f"{row['% of Total']:.0f}% of total")
 
     st.divider()
 
     # Detailed employee table by department (with department averages embedded)
     st.subheader("Employee Metrics by Department")
+    st.caption("ℹ️ HoursSpentPerWeek, CallsPct, EmailsPct, and RPDsPct include estimated time (Calls/Emails/RPDs are not directly tracked) — see the Methodology tab for how each is calculated.")
 
     for dept in sorted(filtered_df['Department'].unique()):
         dept_employees = filtered_df[filtered_df['Department'] == dept].sort_values('HoursSpentPerWeek', ascending=False)
@@ -706,96 +803,78 @@ with tab1:
         display_cols = [col for col in display_cols if col in dept_employees.columns]
 
         with st.expander(f"📂 {dept} ({len(dept_employees)} employees)", expanded=False):
-            # Create department average row
+            # Create department average row (rendered as a pinned row in the grid)
             dept_avg_row = {}
             for col in display_cols:
                 if col == 'EmployeeName':
                     dept_avg_row[col] = 'DEPT AVG'
                 elif col == 'JobTitle':
                     dept_avg_row[col] = ''
-                elif dept_employees[col].dtype in ['int64', 'float64']:
-                    dept_avg_row[col] = dept_employees[col].mean()
+                elif dept_employees[col].dtype.kind in 'if':
+                    dept_avg_row[col] = float(dept_employees[col].mean())
                 else:
                     dept_avg_row[col] = ''
 
-            # Display department average separately (pinned)
-            dept_avg_df = pd.DataFrame([dept_avg_row])
-
-            # Employee data only
             display_df = dept_employees[display_cols].copy()
+            pct_cols = ['CasesPct', 'MeetingsPct', 'CallsPct', 'EmailsPct', 'RPDsPct', 'HitRatePct']
 
-            def highlight_vs_dept_avg(val, col_name, df):
-                """Color a cell based on its variance from department average"""
-                if pd.isna(val) or not isinstance(val, (int, float)):
-                    return ''
+            # Pinned DEPT AVG row is gray/bold; employee rows are colored by variance vs. avg
+            variance_cell_style = JsCode("""
+                function(params) {
+                    if (params.node.rowPinned) {
+                        return {backgroundColor: '#f0f2f6', fontWeight: 'bold'};
+                    }
+                    var val = params.value;
+                    var avg = params.colDef.avgValue;
+                    if (val == null || avg == null || avg === 0 || val === 0) { return {}; }
+                    var variance = ((val - avg) / avg) * 100;
+                    if (variance >= 15) {
+                        var intensity = Math.min(Math.abs(variance) / 100, 1);
+                        return {backgroundColor: 'rgba(12, 163, 12, ' + (intensity * 0.7) + ')'};
+                    } else if (variance <= -15) {
+                        var intensity = Math.min(Math.abs(variance) / 100, 1);
+                        return {backgroundColor: 'rgba(211, 59, 59, ' + (intensity * 0.7) + ')'};
+                    } else {
+                        return {backgroundColor: 'rgba(250, 178, 25, 0.5)'};
+                    }
+                }
+            """)
+            pct_formatter = JsCode("function(params) { return params.value != null ? params.value.toFixed(1) + '%' : ''; }")
+            hours_formatter = JsCode("function(params) { return params.value != null ? params.value.toFixed(2) : ''; }")
+            int_formatter = JsCode("function(params) { return params.value != null ? Math.trunc(params.value).toString() : ''; }")
 
-                col_data = df[col_name]
-                dept_avg = col_data.iloc[0]  # First row is the average
+            # Deterministic content-based width for the two text columns (no JS auto-size timing issues)
+            def text_col_width(col_name, min_width=90, max_width=260):
+                values = [dept_avg_row.get(col_name, '')] + display_df[col_name].astype(str).tolist()
+                max_len = max([len(col_name)] + [len(str(v)) for v in values])
+                return int(min(max_width, max(min_width, max_len * 8 + 24)))
 
-                if dept_avg == 0 or val == 0:
-                    return ''
+            gb = GridOptionsBuilder.from_dataframe(display_df)
+            gb.configure_default_column(resizable=True, sortable=True, filter=False, cellStyle=variance_cell_style)
 
-                variance_pct = ((val - dept_avg) / dept_avg) * 100
-
-                if variance_pct >= 15:  # GREEN - above dept average
-                    intensity = min(abs(variance_pct) / 100, 1)
-                    return f"background-color: rgba(12, 163, 12, {intensity * 0.7})"
-                elif variance_pct <= -15:  # RED - below dept average
-                    intensity = min(abs(variance_pct) / 100, 1)
-                    return f"background-color: rgba(211, 59, 59, {intensity * 0.7})"
-                else:  # YELLOW - within ±15% of dept average
-                    return "background-color: rgba(250, 178, 25, 0.5)"
-
-            # Format department average
-            pct_cols = ['CasesPct', 'MeetingsPct', 'CallsPct', 'EmailsPct', 'RPDsPct']
-            format_dict = {}
-            for col in dept_avg_df.columns:
-                if col in pct_cols:
-                    format_dict[col] = lambda x: f"{x:.1f}%" if isinstance(x, (int, float)) and not pd.isna(x) else x
+            for col in display_cols:
+                if col in ('EmployeeName', 'JobTitle'):
+                    gb.configure_column(col, width=text_col_width(col))
+                elif col == 'TenureYears':
+                    pass  # no variance heatmap on tenure — just display the raw value
+                elif col in pct_cols:
+                    gb.configure_column(col, valueFormatter=pct_formatter, avgValue=dept_avg_row[col])
                 elif col == 'HoursSpentPerWeek':
-                    format_dict[col] = lambda x: f"{x:.2f}" if isinstance(x, (int, float)) and not pd.isna(x) else x
-                elif col == 'HitRatePct':
-                    format_dict[col] = lambda x: f"{x:.1f}%" if isinstance(x, (int, float)) and not pd.isna(x) else x
-                elif col not in ['EmployeeName', 'JobTitle']:
-                    if dept_avg_df[col].dtype in ['int64', 'float64']:
-                        format_dict[col] = lambda x: f"{int(x)}" if isinstance(x, (int, float)) and not pd.isna(x) else x
+                    gb.configure_column(col, valueFormatter=hours_formatter, avgValue=dept_avg_row[col])
+                else:
+                    gb.configure_column(col, valueFormatter=int_formatter, avgValue=dept_avg_row[col])
 
-            styled_avg = dept_avg_df.style.format(format_dict).set_properties(**{'background-color': '#f0f2f6', 'font-weight': 'bold'})
-            st.dataframe(
-                styled_avg,
-                use_container_width=True,
-                hide_index=True
-            )
+            grid_options = gb.build()
+            grid_options['autoSizeStrategy'] = None
+            grid_options['pinnedTopRowData'] = [dept_avg_row]
 
-            # Apply styling to employee data BEFORE formatting
-            styled = display_df.style
-            for col in display_df.columns:
-                if display_df[col].dtype in ['int64', 'float64']:
-                    styled = styled.applymap(
-                        lambda x, c=col: highlight_vs_dept_avg(x, c, dept_avg_df),
-                        subset=[col]
-                    )
-
-            # Now format employees for display
-            format_dict_emp = {}
-            for col in display_df.columns:
-                if col in pct_cols:
-                    format_dict_emp[col] = lambda x: f"{x:.1f}%" if isinstance(x, (int, float)) and not pd.isna(x) else x
-                elif col == 'HoursSpentPerWeek':
-                    format_dict_emp[col] = lambda x: f"{x:.2f}" if isinstance(x, (int, float)) and not pd.isna(x) else x
-                elif col == 'HitRatePct':
-                    format_dict_emp[col] = lambda x: f"{x:.1f}%" if isinstance(x, (int, float)) and not pd.isna(x) else x
-                elif col not in ['EmployeeName', 'JobTitle']:
-                    if display_df[col].dtype in ['int64', 'float64']:
-                        format_dict_emp[col] = lambda x: f"{int(x)}" if isinstance(x, (int, float)) and not pd.isna(x) else x
-
-            styled = styled.format(format_dict_emp)
-
-            st.dataframe(
-                styled,
-                use_container_width=True,
-                height=400,
-                hide_index=True
+            AgGrid(
+                display_df,
+                gridOptions=grid_options,
+                height=460,
+                theme='streamlit',
+                allow_unsafe_jscode=True,
+                key=f"aggrid_{dept}"
             )
 
 # ============================================================================
@@ -804,6 +883,7 @@ with tab1:
 
 with tab2:
     st.subheader("Team Summary")
+    st.info("🚧 Work in Progress")
 
     team_summary = filtered_df.groupby('Department').agg({
         'TotalTimeSpentHours': 'sum',
@@ -847,6 +927,7 @@ with tab2:
 
         st.divider()
         st.subheader("Department Activity Mix")
+        st.caption("ℹ️ Cases & Meetings % are based on actual tracked time. Calls, Emails, and RPDs % are based on time estimates — see the Methodology tab.")
 
         # Heatmap: activity allocation % by department
         dept_activity_mix = filtered_df.groupby('Department')[['CasesPct', 'MeetingsPct', 'CallsPct', 'EmailsPct', 'RPDsPct']].mean()
@@ -875,6 +956,7 @@ with tab2:
 
 with tab3:
     st.subheader("Individual Employee Details")
+    st.info("🚧 Work in Progress")
 
     if len(filtered_df) > 0:
         filtered_df['emp_label'] = filtered_df['EmployeeName'] + ' (' + filtered_df['TenureYears'].astype(str) + ' yrs)'
@@ -901,6 +983,8 @@ with tab3:
                 with col4:
                     with st.container(border=True):
                         st.metric("Tenure (Yrs)", f"{emp_data.get('TenureYears', 'N/A')}")
+
+                st.caption("ℹ️ Total Hours and Hours/Week include estimated time for Calls, Emails, and RPDs — see the Methodology tab for how each is calculated.")
 
                 st.divider()
 
@@ -934,6 +1018,7 @@ with tab3:
                         marker=dict(colors=colors_list)
                     )])
                     fig_emp_pie.update_layout(title=f"Activity Breakdown", height=400)
+                    st.caption("ℹ️ Cases & Meetings hours are actual tracked time. Calls, Emails, and RPDs hours are estimates — see the Methodology tab.")
                     st.plotly_chart(fig_emp_pie, use_container_width=True)
         else:
             st.info("No employees in selected department(s)")
@@ -946,6 +1031,8 @@ with tab3:
 
 with tab4:
     st.subheader("Activity Trends")
+    st.info("🚧 Work in Progress")
+    st.caption("ℹ️ Total Hours includes estimated time for Calls, Emails, and RPDs — see the Methodology tab for how each is calculated.")
 
     # Granularity selector
     col1, col2 = st.columns([1, 3])
@@ -960,7 +1047,19 @@ with tab4:
         trend_df['Period'] = pd.to_datetime(trend_df['Period'])
         trend_df = trend_df.sort_values('Period')
 
-        # Option 1: Org-wide total (default view)
+        # Respect the sidebar's Region/Department filters
+        if selected_regions:
+            trend_df = trend_df[trend_df['Region'].isin(selected_regions)]
+        if selected_dept:
+            trend_df = trend_df[trend_df['Department'].isin(selected_dept)]
+
+    else:
+        trend_df = trend_df.iloc[0:0] if trend_df is not None else pd.DataFrame()
+
+    if trend_df is None or len(trend_df) == 0:
+        st.warning("No trend data available for the current date range and Region/Department filter selection.")
+    else:
+        # Section 1: Org-wide total
         st.write("**Organization-wide Total Hours**")
 
         org_total = trend_df.groupby('Period')['TotalHours'].sum().reset_index()
@@ -988,13 +1087,93 @@ with tab4:
 
         st.divider()
 
-        # Option 2: Department breakdown
+        # Section 2: Per-activity breakdown (stacked area)
+        st.write("**Hours by Activity Type**")
+        st.caption("ℹ️ Cases & Meetings are actual tracked time. Calls, Emails, and RPDs are estimates.")
+
+        activity_hour_cols = {
+            'Cases': 'CaseHours',
+            'Meetings': 'MeetingHours',
+            'Calls': 'CallHours',
+            'Emails': 'EmailHours',
+            'RPDs': 'RPDHours',
+        }
+        activity_trend = trend_df.groupby('Period')[list(activity_hour_cols.values())].sum().reset_index()
+
+        fig_stack = go.Figure()
+        for activity, col_name in activity_hour_cols.items():
+            fig_stack.add_trace(go.Scatter(
+                x=activity_trend['Period'],
+                y=activity_trend[col_name],
+                mode='lines',
+                name=activity,
+                stackgroup='activity',
+                line=dict(color=ACTIVITY_COLORS.get(activity, '#999999'), width=1),
+                hovertemplate=f'<b>{activity}</b><br>%{{x|%b %d, %Y}}: %{{y:.0f}}h<extra></extra>'
+            ))
+
+        fig_stack.update_layout(
+            height=400,
+            hovermode='x unified',
+            xaxis_title='Period',
+            yaxis_title='Hours',
+            legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+        )
+        st.plotly_chart(fig_stack, use_container_width=True)
+
+        st.divider()
+
+        # Section 3: Region breakdown
+        st.write("**Trends by Region**")
+
+        region_options = sorted(trend_df['Region'].dropna().unique())
+        region_default = [r for r in selected_regions if r in region_options] or region_options
+
+        region_filter = st.multiselect(
+            "Regions to display",
+            options=region_options,
+            default=region_default,
+            key="trend_region_filter"
+        )
+
+        if region_filter:
+            region_trend = trend_df[trend_df['Region'].isin(region_filter)]
+            region_agg = region_trend.groupby(['Period', 'Region'])['TotalHours'].sum().reset_index()
+
+            fig_region = go.Figure()
+            for i, region in enumerate(region_filter):
+                region_data = region_agg[region_agg['Region'] == region].sort_values('Period')
+                fig_region.add_trace(go.Scatter(
+                    x=region_data['Period'],
+                    y=region_data['TotalHours'],
+                    mode='lines+markers',
+                    name=region,
+                    line=dict(color=CATEGORICAL[i % len(CATEGORICAL)], width=2),
+                    hovertemplate='<b>%{x|%b %d, %Y}</b><br>%{fullData.name}: %{y:.0f}h<extra></extra>'
+                ))
+
+            fig_region.update_layout(
+                height=400,
+                hovermode='x unified',
+                xaxis_title='Period',
+                yaxis_title='Hours',
+                legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
+            )
+            st.plotly_chart(fig_region, use_container_width=True)
+
+        st.divider()
+
+        # Section 4: Department breakdown
         st.write("**Trends by Department**")
+
+        dept_options = sorted(trend_df['Department'].unique())
+        dept_default = [d for d in selected_dept if d in dept_options] or dept_options[:3]
 
         dept_filter = st.multiselect(
             "Departments to display",
-            options=sorted(trend_df['Department'].unique()),
-            default=sorted(trend_df['Department'].unique())[:3]
+            options=dept_options,
+            default=dept_default,
+            key="trend_dept_filter"
         )
 
         if len(dept_filter) > 5:
@@ -1034,8 +1213,6 @@ with tab4:
             use_container_width=True,
             height=400
         )
-    else:
-        st.warning("No trend data available for the selected date range")
 
 # ============================================================================
 # TAB 5: DATA & EXPORT
@@ -1060,6 +1237,172 @@ with tab5:
         file_name=f"workforce_analytics_{fy_start}_{fy_end}.csv",
         mime="text/csv"
     )
+
+# ============================================================================
+# TAB 6: METHODOLOGY
+# ============================================================================
+
+with tab6:
+    st.subheader("Methodology & FAQ")
+    st.write("How every metric in this dashboard is calculated, including which numbers are actual tracked time vs. estimates.")
+
+    st.divider()
+    st.markdown("### Source Tables")
+    st.markdown("""
+- `ea_prod.crmfacts_gold.cases` — Case/ticket data
+- `ea_prod.crmfacts_gold.vmeetings` — Meeting activity data
+- `ea_prod.crmfacts_gold.vactivity` — Call and email activity data
+""")
+
+    st.markdown("### Global Filters Applied")
+    st.markdown("""
+- **Date Filter:** `OpenedDate` / `MeetingDate` / `activity_date` within the selected date range
+- **Team Filter:** `JobFamily = 'Client Consulting'` (all active Client Consulting departments)
+""")
+
+    st.divider()
+
+    with st.expander("📁 Case Metrics", expanded=False):
+        st.markdown("""
+**Source:** `case_metrics` CTE, from `ea_prod.crmfacts_gold.cases`
+
+**TotalCases**
+- SQL: `COUNT(*)`
+- Logic: Count all cases where person is the `CaseOwner`
+- Group By: `CaseOwner`
+
+**CasesCreated**
+- Source CTE: `delegation_metrics`
+- SQL: `COUNT(*)`
+- Logic: Count all cases where person is the `CreatedBy`
+- Group By: `CreatedBy`
+- Join: Filtered to only team members via `INNER JOIN team_members`
+
+**CasesDelegated**
+- Source CTE: `delegation_metrics`
+- SQL: `SUM(CASE WHEN c.CreatedBy != c.CaseOwner THEN 1 ELSE 0 END)`
+- Logic: Count cases where `CreatedBy` = person BUT `CaseOwner` ≠ person (delegated away)
+
+**CasesReceived**
+- Source CTE: `delegation_combined`
+- SQL: `(CurrentCasesOwned - (TotalCasesCreated - CasesDelegatedAway))`
+- Formula: `CasesReceived = TotalCases - (CasesCreated - CasesDelegated)`
+
+**TotalCaseHours** — *actual tracked time*
+- Source CTE: `case_metrics`
+- SQL: `ROUND(SUM(CAST(TimeToResolutionHrs AS DOUBLE)), 2)`
+- Field Used: `TimeToResolutionHrs` (string converted to double)
+""")
+
+    with st.expander("📅 Meeting Metrics", expanded=False):
+        st.markdown("""
+**Source:** `meeting_metrics` CTE, from `ea_prod.crmfacts_gold.vmeetings`
+
+**Data Quality Filter:** `WHERE DurationInMinutes <= 480` — filters out meetings > 8 hours (data quality issue)
+
+**Deduplication — two levels**, to avoid row multiplication when joining attendee counts to meeting durations:
+
+- *Dedup Level 1* — one row per `(MeetingId, EmployeeName)` via `meeting_dedup` → `unique_meetings`. Used for `UniqueMeetings` and `MeetingHours`.
+- *Dedup Level 2* — one row per `(MeetingId, EmployeeName, IndividualId)` via `attendee_dedup` → `unique_attendees` (with `IndividualId IS NOT NULL`). Used for `UniqueClientsMetWith` and `UsersPerMeeting`.
+
+The two levels are aggregated independently into `meeting_counts` and `attendee_counts`, then joined on `EmployeeName`. This prevents meeting durations from being multiplied by the number of attendees.
+
+**UniqueMeetings** — *actual tracked time*
+- SQL: `COUNT(DISTINCT um.MeetingId)` from `meeting_counts` (Dedup Level 1)
+
+**UniqueClientsMetWith**
+- SQL: `COUNT(DISTINCT ua.IndividualId)` from `attendee_counts` (Dedup Level 2)
+- Logic: Distinct client contacts met with at least once. A client in 10 different meetings counts as 1. Only non-null `IndividualId` counted.
+
+**UsersPerMeeting**
+- SQL: `ROUND(TotalAttendeeSlots * 1.0 / NULLIF(UniqueMeetings, 0), 2)` where `TotalAttendeeSlots = COUNT(ua.IndividualId)`
+- Logic: True average client attendees per meeting. Numerator is total (meeting, client) pairs, not distinct — one client in 3 meetings contributes 3.
+
+**MeetingHours** — *actual tracked time*
+- SQL: `ROUND(SUM(um.DurationInMinutes) / 60, 2)` from `meeting_counts` (Dedup Level 1)
+""")
+
+    with st.expander("📞 Call Metrics — ESTIMATED", expanded=False):
+        st.markdown("""
+**Source:** `call_email_metrics` CTE, from `ea_prod.crmfacts_gold.vactivity`
+
+**Activity Type Filter:** `WHERE activity_type IN ('Call', 'Email')`
+
+**Deduplication:** `deduplicated_activities` CTE — `ROW_NUMBER() OVER (PARTITION BY id, activity_owner_id ORDER BY id)` removes duplicate activity records
+
+**Employee Matching:** `INNER JOIN case_owners ON a.EmployeeId = co.CaseOwnerId` — matches activity owner ID to case owner ID
+
+**UniqueCalls**
+- SQL: `COUNT(DISTINCT CASE WHEN a.ActivityType = 'Call' THEN a.ActivityId END)`
+
+**ConnectionsMade**
+- SQL: `SUM(CASE WHEN a.ActivityType = 'Call' AND a.ConnectionOutcome = 'Connection Made' THEN 1 ELSE 0 END)`
+
+**HitRatePct**
+- Formula: `(ConnectionsMade ÷ UniqueCalls) × 100`
+- `NULLIF` prevents division by zero
+
+**CallTimeSpentHours — ⚠️ ESTIMATE, not actual tracked time**
+- Formula: `((Missed Calls × 2 min) + (Connected Calls × 5 min)) ÷ 60`
+- Assumption: missed calls = 2 minutes each, connected calls = 5 minutes each
+""")
+
+    with st.expander("✉️ Email Metrics — ESTIMATED", expanded=False):
+        st.markdown("""
+**Source:** `call_email_metrics` CTE, from `ea_prod.crmfacts_gold.vactivity`
+
+**EmailCount**
+- SQL: `COUNT(DISTINCT CASE WHEN a.ActivityType = 'Email' THEN a.ActivityId END)`
+
+**EmailHours — ⚠️ ESTIMATE, not actual tracked time**
+- Formula: `(EmailCount × 10 min) ÷ 60`
+- Assumption: each email = 10 minutes
+""")
+
+    with st.expander("📋 RPD Metrics — ESTIMATED", expanded=False):
+        st.markdown("""
+**Source:** `ea_prod.rpdfacts_gold.f_tr_rpd_comments` (comments) and `ea_prod.reporting_gold.pbi_rpd` (authored)
+
+**RPDs_Authored**
+- SQL: `COUNT(DISTINCT` `RPD#``)` from `rpd_authored_agg`, matched via `Author ID`
+
+**RPD_Comments**
+- SQL: `COUNT(*)` from `rpd_comments_agg`, matched via `CommenterId`
+
+**RPD_EstHours — ⚠️ ESTIMATE, not actual tracked time**
+- Formula: `(RPDs_Authored × 20 min + RPD_Comments × 10 min) ÷ 60`
+- Assumption: 20 minutes per RPD authored, 10 minutes per comment made
+""")
+
+    with st.expander("⏱️ Aggregate Time Metrics", expanded=False):
+        st.markdown("""
+**TotalTimeSpentHours**
+- Formula: `TotalCaseHours + MeetingHours + CallTimeSpentHours + EmailHours + RPD_EstHours`
+- Uses `COALESCE` to treat NULLs as 0
+- Mix of actual tracked time (Cases, Meetings) and estimates (Calls, Emails, RPDs)
+
+**HoursSpentPerWeek**
+- Formula: `TotalTimeSpentHours ÷ (Business Days in Period ÷ 5)`
+- Logic: Average hours spent per week over the selected date range, using a Mon–Fri business-day calendar (federal holidays excluded)
+- `NULLIF` prevents division by zero
+""")
+
+    with st.expander("🔗 Final Join Logic", expanded=False):
+        st.markdown("""
+```
+FROM filtered_employees fe
+LEFT JOIN case_metrics c        ON fe.FullName_FNF = c.CaseOwner
+LEFT JOIN delegation_combined d ON fe.FullName_FNF = d.EmployeeName
+LEFT JOIN meeting_metrics m     ON fe.FullName_FNF = m.EmployeeName
+LEFT JOIN call_email_metrics ce ON fe.FullName_FNF = ce.EmployeeName
+LEFT JOIN rpd_comments_agg rpd  ON fe.EmployeeID = rpd.EmployeeId
+LEFT JOIN rpd_authored_agg ra   ON fe.EmployeeID = ra.AuthorId
+```
+
+- **Anchor:** All active Client Consulting employees (`filtered_employees`), so zero-activity employees are still included
+- **Join Type:** `LEFT JOIN` — every employee is included even with no cases/meetings/calls/emails
+- **COALESCE:** Replaces NULL values with 0 for employees with no activity in a category
+""")
 
 # Info footer
 st.sidebar.markdown("---")
