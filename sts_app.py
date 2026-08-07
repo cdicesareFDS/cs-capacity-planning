@@ -44,53 +44,60 @@ def capacity_status(hours_per_week, group_average, variance_pct):
 # DATA LOADING & PREP
 # ============================================================================
 
-@st.cache_resource
 def get_databricks_connection():
-    """Create a persistent Databricks connection"""
+    """Create a Databricks SQL connection using the logged-in user's credentials."""
     import sys
     import os
+    from databricks import sql
 
-    # Try Databricks App first: use WorkspaceClient's credentials for SQL
+    # In Databricks App: use the logged-in user's forwarded token
+    user_token = st.context.headers.get("x-forwarded-access-token")
+    if user_token:
+        # Get host directly from environment (avoid Config() interference with SP creds)
+        host = os.environ.get("DATABRICKS_HOST", "").replace("https://", "").replace("http://", "").strip("/")
+        print(f"[get_databricks_connection] Using user auth token (len={len(user_token)}, starts={user_token[:8]}...)", file=sys.stderr)
+        print(f"[get_databricks_connection] Host: {host}", file=sys.stderr)
+
+        connection = sql.connect(
+            server_hostname=host,
+            http_path="/sql/1.0/warehouses/5534359f9aac6560",
+            access_token=user_token,
+        )
+        print("[get_databricks_connection] Connected successfully!", file=sys.stderr)
+        return connection
+
+    # Fallback: try service principal auth
     try:
         from databricks.sdk import WorkspaceClient
-        from databricks import sql
-        print("[get_databricks_connection] Trying Databricks App auth...", file=sys.stderr)
-
+        print("[get_databricks_connection] No user token, trying SP auth...", file=sys.stderr)
         w = WorkspaceClient()
-
-        # Create a credentials provider that uses WorkspaceClient's auth
-        def credential_provider():
-            return w.config.authenticate()
-
-        print(f"[get_databricks_connection] Connecting to {w.config.host}...", file=sys.stderr)
-
-        return sql.connect(
-            server_hostname=w.config.host.replace("https://", ""),
-            http_path="/sql/1.0/warehouses/5534359f9aac6560",
-            credentials_provider=credential_provider,
-        )
+        auth_headers = w.config.authenticate()
+        token = auth_headers.get("Authorization", "").replace("Bearer ", "")
+        if token:
+            host = w.config.host.replace("https://", "").replace("http://", "").strip("/")
+            connection = sql.connect(
+                server_hostname=host,
+                http_path="/sql/1.0/warehouses/5534359f9aac6560",
+                access_token=token,
+            )
+            print("[get_databricks_connection] Connected via SP auth!", file=sys.stderr)
+            return connection
     except Exception as e:
-        import traceback
-        print(f"[get_databricks_connection] Databricks App auth failed: {e}", file=sys.stderr)
-        print(f"[get_databricks_connection] Traceback: {traceback.format_exc()}", file=sys.stderr)
+        print(f"[get_databricks_connection] SP auth failed: {e}", file=sys.stderr)
 
     # Fallback: local dev with OAuth (only if secrets exist)
-    try:
-        # Check if secrets file exists before accessing
-        secrets_path = os.path.expanduser("~/.streamlit/secrets.toml")
-        if not os.path.exists(secrets_path):
-            raise Exception("No secrets.toml found - running in Databricks App?")
-
+    secrets_path = os.path.expanduser("~/.streamlit/secrets.toml")
+    if os.path.exists(secrets_path):
         host = st.secrets.get("DATABRICKS_HOST")
         http_path = st.secrets.get("DATABRICKS_HTTP_PATH")
-        print(f"[get_databricks_connection] Using OAuth with host: {host}", file=sys.stderr)
+        print(f"[get_databricks_connection] Using local OAuth with host: {host}", file=sys.stderr)
         return connect(
             server_hostname=host,
             http_path=http_path,
             auth_type="oauth"
         )
-    except Exception as e:
-        raise Exception(f"Failed to connect to Databricks: {e}")
+
+    raise Exception("No authentication available - no user token or secrets.toml found")
 
 @st.cache_data
 def load_trend_data(fy_start, fy_end, granularity="month"):
