@@ -110,9 +110,12 @@ def load_trend_data(fy_start, fy_end, granularity="month"):
         # Build the query with date_trunc for bucketing
         query = f"""
             WITH filtered_employees AS (
-              SELECT DISTINCT EmployeeID, FullName_FNF, JobTitle, Department, Active
-              FROM ea_prod.reference_gold.employee
-              WHERE JobFamily = 'Client Consulting' AND Active = 1
+              SELECT DISTINCT e.EmployeeID, e.FullName_FNF, e.JobTitle, e.Department, e.Active
+              FROM ea_prod.reference_gold.employee e
+              INNER JOIN ea_prod.reference_gold.department_hierarchy dh
+                ON e.DepartmentId = dh.DepartmentID AND dh.Current = true
+              WHERE e.JobFamily = 'Client Consulting' AND e.Active = 1
+                AND dh.DepartmentTypeName = 'Consulting - Generalist'
             ),
             dept_region AS (
               SELECT DISTINCT
@@ -255,17 +258,23 @@ def load_data(fy_start, fy_end):
                 SUM(CAST(c.TimeToResolutionHrs AS DOUBLE)) as TotalCaseTime
               FROM ea_prod.crmfacts_gold.cases c
               INNER JOIN (
-                SELECT DISTINCT EmployeeID, FullName_FNF, JobTitle, Department
-                FROM ea_prod.reference_gold.employee
-                WHERE JobFamily = 'Client Consulting' AND Active = 1
+                SELECT DISTINCT e.EmployeeID, e.FullName_FNF, e.JobTitle, e.Department
+                FROM ea_prod.reference_gold.employee e
+                INNER JOIN ea_prod.reference_gold.department_hierarchy dh
+                  ON e.DepartmentId = dh.DepartmentID AND dh.Current = true
+                WHERE e.JobFamily = 'Client Consulting' AND e.Active = 1
+                  AND dh.DepartmentTypeName = 'Consulting - Generalist'
               ) fe ON c.CaseOwnerId = fe.EmployeeID
               WHERE c.OpenedDate >= '{fy_start}' AND c.OpenedDate <= '{fy_end}'
               GROUP BY fe.Department, c.CaseOwner
             ),
             filtered_employees AS (
-              SELECT DISTINCT EmployeeID, FullName_FNF, JobTitle, Department, Active
-              FROM ea_prod.reference_gold.employee
-              WHERE JobFamily = 'Client Consulting' AND Active = 1
+              SELECT DISTINCT e.EmployeeID, e.FullName_FNF, e.JobTitle, e.Department, e.Active
+              FROM ea_prod.reference_gold.employee e
+              INNER JOIN ea_prod.reference_gold.department_hierarchy dh
+                ON e.DepartmentId = dh.DepartmentID AND dh.Current = true
+              WHERE e.JobFamily = 'Client Consulting' AND e.Active = 1
+                AND dh.DepartmentTypeName = 'Consulting - Generalist'
             ),
             team_members AS (
               SELECT DISTINCT c.CaseOwner, c.CaseOwnerId, fe.Department
@@ -618,6 +627,7 @@ filtered_df['CapacityStatus'], filtered_df['CapacityColor'], filtered_df['Capaci
 total_hours = filtered_df['TotalTimeSpentHours'].sum() if len(filtered_df) > 0 else 0
 avg_hours_per_week = filtered_df['HoursSpentPerWeek'].mean() if len(filtered_df) > 0 else 0
 total_employees = len(filtered_df)
+total_departments = filtered_df['Department'].nunique() if len(filtered_df) > 0 else 0
 total_cases = filtered_df['TotalCases'].sum() if len(filtered_df) > 0 else 0
 total_meetings = filtered_df['UniqueMeetings'].sum() if len(filtered_df) > 0 else 0
 
@@ -641,7 +651,7 @@ with tab1:
     st.subheader("Executive Summary")
 
     # KPI row with cards
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
 
     with col1:
         with st.container(border=True):
@@ -657,9 +667,13 @@ with tab1:
 
     with col4:
         with st.container(border=True):
-            st.metric("Total Cases", f"{total_cases:,.0f}")
+            st.metric("Departments", f"{total_departments}")
 
     with col5:
+        with st.container(border=True):
+            st.metric("Total Cases", f"{total_cases:,.0f}")
+
+    with col6:
         with st.container(border=True):
             st.metric("Total Meetings", f"{total_meetings:,.0f}")
 
