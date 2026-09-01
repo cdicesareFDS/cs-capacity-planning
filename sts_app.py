@@ -3,6 +3,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta, date as _date
+from decimal import Decimal
 import numpy as np
 from databricks.sql import connect
 from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
@@ -102,12 +103,20 @@ def get_databricks_connection():
 
 @st.cache_data
 def load_trend_data(fy_start, fy_end, granularity="month"):
-    """Query Databricks for time-series trends (weekly or monthly)"""
+    """Query Databricks for time-series trends (weekly, monthly, or fiscal quarterly)"""
     try:
         conn = get_databricks_connection()
         cursor = conn.cursor()
 
-        # Build the query with date_trunc for bucketing
+        def period_expr(date_expr):
+            """Bucket a date expression by granularity. Fiscal year starts Sept 1, so
+            'quarter' buckets to fiscal quarters (Sep-Nov, Dec-Feb, Mar-May, Jun-Aug) by
+            shifting 8 months before truncating to calendar quarter, then shifting back."""
+            if granularity == 'quarter':
+                return f"ADD_MONTHS(DATE_TRUNC('quarter', ADD_MONTHS({date_expr}, -8)), 8)"
+            return f"DATE_TRUNC('{granularity}', {date_expr})"
+
+        # Build the query with fiscal-aware period bucketing
         query = f"""
             WITH filtered_employees AS (
               SELECT DISTINCT e.EmployeeID, e.FullName_FNF, e.JobTitle, e.Department, e.Active
@@ -132,18 +141,18 @@ def load_trend_data(fy_start, fy_end, granularity="month"):
             ),
             case_trend AS (
               SELECT
-                DATE_TRUNC('{granularity}', c.OpenedDate) as Period,
+                {period_expr('c.OpenedDate')} as Period,
                 fe.Department,
                 COUNT(*) as TotalCases,
                 SUM(CAST(c.TimeToResolutionHrs AS DOUBLE)) as CaseHours
               FROM ea_prod.crmfacts_gold.cases c
               INNER JOIN filtered_employees fe ON c.CaseOwnerId = fe.EmployeeID
               WHERE c.OpenedDate >= '{fy_start}' AND c.OpenedDate <= '{fy_end}'
-              GROUP BY DATE_TRUNC('{granularity}', c.OpenedDate), fe.Department
+              GROUP BY {period_expr('c.OpenedDate')}, fe.Department
             ),
             meeting_trend AS (
               SELECT
-                DATE_TRUNC('{granularity}', v.MeetingDate) as Period,
+                {period_expr('v.MeetingDate')} as Period,
                 fe.Department,
                 COUNT(DISTINCT v.MeetingId) as UniqueMeetings,
                 ROUND(SUM(v.DurationInMinutes) / 60, 2) as MeetingHours
@@ -151,11 +160,11 @@ def load_trend_data(fy_start, fy_end, granularity="month"):
               INNER JOIN filtered_employees fe ON v.EmployeeName = fe.FullName_FNF
               WHERE v.MeetingDate >= '{fy_start}' AND v.MeetingDate <= '{fy_end}'
                 AND v.DurationInMinutes <= 480
-              GROUP BY DATE_TRUNC('{granularity}', v.MeetingDate), fe.Department
+              GROUP BY {period_expr('v.MeetingDate')}, fe.Department
             ),
             call_email_trend AS (
               SELECT
-                DATE_TRUNC('{granularity}', a.activity_date) as Period,
+                {period_expr('a.activity_date')} as Period,
                 fe.Department,
                 COUNT(DISTINCT CASE WHEN a.activity_type = 'Call' THEN a.id END) as CallCount,
                 ROUND((((COUNT(DISTINCT CASE WHEN a.activity_type = 'Call' THEN a.id END) -
@@ -167,29 +176,29 @@ def load_trend_data(fy_start, fy_end, granularity="month"):
               INNER JOIN filtered_employees fe ON a.activity_owner_id = fe.EmployeeID
               WHERE a.activity_date >= '{fy_start}' AND a.activity_date <= '{fy_end}'
                 AND a.activity_type IN ('Call', 'Email')
-              GROUP BY DATE_TRUNC('{granularity}', a.activity_date), fe.Department
+              GROUP BY {period_expr('a.activity_date')}, fe.Department
             ),
             rpd_authored_trend AS (
               SELECT
-                DATE_TRUNC('{granularity}', ra.`Created Date`) as Period,
+                {period_expr('ra.`Created Date`')} as Period,
                 fe.Department,
                 COUNT(DISTINCT ra.`RPD#`) as RPDs_Authored
               FROM ea_prod.reporting_gold.pbi_rpd ra
               INNER JOIN filtered_employees fe ON TRY_CAST(ra.`Author ID` AS INT) = fe.EmployeeID
               WHERE ra.`Created Date` >= '{fy_start}' AND ra.`Created Date` <= '{fy_end}'
                 AND TRY_CAST(ra.`Author ID` AS INT) IS NOT NULL
-              GROUP BY DATE_TRUNC('{granularity}', ra.`Created Date`), fe.Department
+              GROUP BY {period_expr('ra.`Created Date`')}, fe.Department
             ),
             rpd_comments_trend AS (
               SELECT
-                DATE_TRUNC('{granularity}', TO_DATE(CAST(rc.CommentDateKey AS STRING), 'yyyyMMdd')) as Period,
+                {period_expr("TO_DATE(CAST(rc.CommentDateKey AS STRING), 'yyyyMMdd')")} as Period,
                 fe.Department,
                 COUNT(*) as RPD_Comments
               FROM ea_prod.rpdfacts_gold.f_tr_rpd_comments rc
               INNER JOIN filtered_employees fe ON rc.CommenterId = fe.EmployeeID
               WHERE rc.CommentDateKey >= REPLACE('{fy_start}', '-', '')
                 AND rc.CommentDateKey <= REPLACE('{fy_end}', '-', '')
-              GROUP BY DATE_TRUNC('{granularity}', TO_DATE(CAST(rc.CommentDateKey AS STRING), 'yyyyMMdd')), fe.Department
+              GROUP BY {period_expr("TO_DATE(CAST(rc.CommentDateKey AS STRING), 'yyyyMMdd')")}, fe.Department
             )
             SELECT
               COALESCE(c.Period, m.Period, e.Period, ra.Period, rc.Period) as Period,
@@ -228,6 +237,68 @@ def load_trend_data(fy_start, fy_end, granularity="month"):
         return df
     except Exception as e:
         st.error(f"Error loading trend data from Databricks: {e}")
+        return None
+
+@st.cache_data(ttl=86400)
+def load_accounts_users_data():
+    """Query Databricks for employee account/user coverage (cached 24 hours)"""
+    import sys
+    import time
+    try:
+        t0 = time.time()
+        print(f"[load_accounts_users_data] Connecting...", file=sys.stderr)
+        conn = get_databricks_connection()
+        cursor = conn.cursor()
+
+        query = """
+            WITH filtered_employees AS (
+              SELECT DISTINCT e.EmployeeID, e.FullName_FNF
+              FROM ea_prod.reference_gold.employee e
+              INNER JOIN ea_prod.reference_gold.department_hierarchy dh
+                ON e.DepartmentId = dh.DepartmentID AND dh.Current = true
+              WHERE e.JobFamily = 'Client Consulting' AND e.Active = 1
+                AND dh.DepartmentTypeName = 'Consulting - Generalist'
+            ),
+            employee_locations AS (
+              SELECT
+                fe.EmployeeID,
+                fe.FullName_FNF as EmployeeName,
+                atm.LocationId
+              FROM filtered_employees fe
+              LEFT JOIN ea_prod.reference_gold.account_team_member atm
+                ON fe.EmployeeID = atm.EmployeeId
+            ),
+            locations_with_users AS (
+              SELECT
+                el.EmployeeID,
+                el.EmployeeName,
+                u.mainlocationid,
+                u.userid
+              FROM employee_locations el
+              LEFT JOIN ea_prod.reference_gold.user u
+                ON el.LocationId = u.locationid
+                AND u.current = 1
+                AND u.active = 1
+                AND u.usertype = 'Normal'
+            )
+            SELECT
+              EmployeeID,
+              EmployeeName,
+              COUNT(DISTINCT mainlocationid) as AccountsCovered,
+              COUNT(DISTINCT userid) as UsersCovered
+            FROM locations_with_users
+            GROUP BY EmployeeID, EmployeeName
+        """
+
+        print(f"[load_accounts_users_data] Executing query... (t+{time.time()-t0:.1f}s)", file=sys.stderr)
+        cursor.execute(query)
+        print(f"[load_accounts_users_data] Query executed, fetching... (t+{time.time()-t0:.1f}s)", file=sys.stderr)
+        df = cursor.fetchall_arrow().to_pandas()
+        print(f"[load_accounts_users_data] Done: {len(df)} rows (t+{time.time()-t0:.1f}s)", file=sys.stderr)
+        cursor.close()
+        return df
+    except Exception as e:
+        print(f"[load_accounts_users_data] Error: {e}", file=sys.stderr)
         return None
 
 @st.cache_data
@@ -444,6 +515,7 @@ def load_data(fy_start, fy_end):
                 WHEN dh_region.Region = 'Asia' THEN 'AsiaPac'
                 ELSE COALESCE(dh_region.Region, 'Unknown')
               END as Region,
+              fe.EmployeeID,
               fe.Department,
               fe.FullName_FNF as EmployeeName,
               REPLACE(fe.JobTitle, ', Client Solutions', '') as JobTitle,
@@ -563,6 +635,20 @@ df = load_data(fy_start, fy_end)
 
 if df is None:
     st.stop()
+
+# Load accounts/users coverage separately (cached 24h) and merge
+accounts_users_df = load_accounts_users_data()
+if accounts_users_df is not None and len(accounts_users_df) > 0:
+    df = df.merge(
+        accounts_users_df[['EmployeeID', 'AccountsCovered', 'UsersCovered']],
+        on='EmployeeID',
+        how='left'
+    )
+    df['AccountsCovered'] = df['AccountsCovered'].fillna(0).astype(int)
+    df['UsersCovered'] = df['UsersCovered'].fillna(0).astype(int)
+else:
+    df['AccountsCovered'] = 0
+    df['UsersCovered'] = 0
 
 # Get unique regions and departments
 regions = sorted(df['Region'].unique().tolist())
@@ -704,6 +790,61 @@ with tab1:
 
     st.divider()
 
+    # Client Coverage Section
+    st.subheader("Client Coverage")
+
+    total_accounts_covered = filtered_df['AccountsCovered'].sum() if len(filtered_df) > 0 else 0
+    total_users_covered = filtered_df['UsersCovered'].sum() if len(filtered_df) > 0 else 0
+    avg_accounts_per_employee = filtered_df['AccountsCovered'].mean() if len(filtered_df) > 0 else 0
+    avg_users_per_employee = filtered_df['UsersCovered'].mean() if len(filtered_df) > 0 else 0
+
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        with st.container(border=True):
+            st.metric("Total Accounts Covered", f"{total_accounts_covered:,.0f}")
+    with col2:
+        with st.container(border=True):
+            st.metric("Total Users Covered", f"{total_users_covered:,.0f}")
+    with col3:
+        with st.container(border=True):
+            st.metric("Avg Accounts / Employee", f"{avg_accounts_per_employee:,.1f}")
+    with col4:
+        with st.container(border=True):
+            st.metric("Avg Users / Employee", f"{avg_users_per_employee:,.1f}")
+
+    if len(filtered_df) > 0:
+        coverage_by_dept = filtered_df.groupby('Department')[['AccountsCovered', 'UsersCovered']].sum().reset_index()
+        coverage_by_dept = coverage_by_dept.sort_values('AccountsCovered', ascending=True)
+
+        fig_coverage = go.Figure()
+        fig_coverage.add_trace(go.Bar(
+            y=coverage_by_dept['Department'],
+            x=coverage_by_dept['AccountsCovered'],
+            orientation='h',
+            name='Accounts Covered',
+            marker=dict(color=CATEGORICAL[0]),
+            hovertemplate='<b>%{y}</b><br>Accounts: %{x:,.0f}<extra></extra>'
+        ))
+        fig_coverage.add_trace(go.Bar(
+            y=coverage_by_dept['Department'],
+            x=coverage_by_dept['UsersCovered'],
+            orientation='h',
+            name='Users Covered',
+            marker=dict(color=CATEGORICAL[1]),
+            hovertemplate='<b>%{y}</b><br>Users: %{x:,.0f}<extra></extra>'
+        ))
+        fig_coverage.update_layout(
+            height=max(300, 40 * len(coverage_by_dept)),
+            barmode='group',
+            xaxis_title='Count',
+            yaxis_title='',
+            legend=dict(yanchor="bottom", y=1.02, xanchor="left", x=0, orientation="h"),
+            margin=dict(l=0, r=0, t=40, b=0)
+        )
+        st.plotly_chart(fig_coverage, use_container_width=True)
+
+    st.divider()
+
     # Time Allocation Section (enhanced)
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -809,7 +950,8 @@ with tab1:
     for dept in sorted(filtered_df['Department'].unique()):
         dept_employees = filtered_df[filtered_df['Department'] == dept].sort_values('HoursSpentPerWeek', ascending=False)
 
-        display_cols = ['EmployeeName', 'JobTitle', 'TenureYears', 'HoursSpentPerWeek',
+        display_cols = ['EmployeeName', 'JobTitle', 'TenureYears', 'AccountsCovered', 'UsersCovered',
+                       'HoursSpentPerWeek',
                        'TotalCases', 'UniqueMeetings', 'UniqueCalls', 'HitRatePct', 'EmailCount', 'RPDs_Authored',
                        'CasesPct', 'MeetingsPct', 'CallsPct', 'EmailsPct', 'RPDsPct']
 
@@ -866,17 +1008,23 @@ with tab1:
             gb = GridOptionsBuilder.from_dataframe(display_df)
             gb.configure_default_column(resizable=True, sortable=True, filter=False, cellStyle=variance_cell_style)
 
+            pinned_cols = {'EmployeeName'}
+
             for col in display_cols:
+                pin_opts = {'pinned': 'left'} if col in pinned_cols else {}
+
                 if col in ('EmployeeName', 'JobTitle'):
-                    gb.configure_column(col, width=text_col_width(col))
+                    gb.configure_column(col, width=text_col_width(col), **pin_opts)
                 elif col == 'TenureYears':
-                    pass  # no variance heatmap on tenure — just display the raw value
+                    gb.configure_column(col, **pin_opts)  # no variance heatmap — display raw value
+                elif col in ('AccountsCovered', 'UsersCovered'):
+                    gb.configure_column(col, valueFormatter=int_formatter, **pin_opts)  # no variance heatmap
                 elif col in pct_cols:
-                    gb.configure_column(col, valueFormatter=pct_formatter, avgValue=dept_avg_row[col])
+                    gb.configure_column(col, valueFormatter=pct_formatter, avgValue=dept_avg_row[col], **pin_opts)
                 elif col == 'HoursSpentPerWeek':
-                    gb.configure_column(col, valueFormatter=hours_formatter, avgValue=dept_avg_row[col])
+                    gb.configure_column(col, valueFormatter=hours_formatter, avgValue=dept_avg_row[col], **pin_opts)
                 else:
-                    gb.configure_column(col, valueFormatter=int_formatter, avgValue=dept_avg_row[col])
+                    gb.configure_column(col, valueFormatter=int_formatter, avgValue=dept_avg_row[col], **pin_opts)
 
             grid_options = gb.build()
             grid_options['autoSizeStrategy'] = None
@@ -897,7 +1045,6 @@ with tab1:
 
 with tab2:
     st.subheader("Team Summary")
-    st.info("🚧 Work in Progress")
 
     team_summary = filtered_df.groupby('Department').agg({
         'TotalTimeSpentHours': 'sum',
@@ -914,16 +1061,18 @@ with tab2:
         col1, col2 = st.columns(2)
 
         with col1:
+            team_hrs_sorted = team_summary.reset_index().sort_values('TotalTimeSpentHours', ascending=True)
             fig_team_hrs = px.bar(
-                team_summary.reset_index(),
-                x='Department',
-                y='TotalTimeSpentHours',
+                team_hrs_sorted,
+                x='TotalTimeSpentHours',
+                y='Department',
+                orientation='h',
                 title='Total Hours by Department',
-                labels={'TotalTimeSpentHours': 'Hours', 'Department': 'Department'},
+                labels={'TotalTimeSpentHours': 'Hours', 'Department': ''},
                 color='HoursSpentPerWeek',
                 color_continuous_scale=SEQUENTIAL_BLUE
             )
-            fig_team_hrs.update_layout(xaxis_tickangle=-45, height=400)
+            fig_team_hrs.update_layout(height=max(400, 30 * len(team_hrs_sorted)), margin=dict(l=0, r=0, t=40, b=0))
             st.plotly_chart(fig_team_hrs, use_container_width=True)
 
         with col2:
@@ -948,21 +1097,42 @@ with tab2:
         dept_activity_mix.columns = ['Cases', 'Meetings', 'Calls', 'Emails', 'RPDs']
 
         fig_heatmap = go.Figure(data=go.Heatmap(
-            z=dept_activity_mix.T.values,
-            x=dept_activity_mix.index,
-            y=['Cases', 'Meetings', 'Calls', 'Emails', 'RPDs'],
+            z=dept_activity_mix.values,
+            x=['Cases', 'Meetings', 'Calls', 'Emails', 'RPDs'],
+            y=dept_activity_mix.index,
             colorscale=SEQUENTIAL_BLUE,
             hovertemplate='<b>%{y}</b> | %{x}<br>%{z:.1f}%<extra></extra>',
-            text=np.round(dept_activity_mix.T.values, 1),
+            text=np.round(dept_activity_mix.values, 1),
             texttemplate='%{text:.1f}%',
             textfont={"size": 10}
         ))
-        fig_heatmap.update_layout(height=300, xaxis_tickangle=-45)
+        fig_heatmap.update_layout(height=max(300, 30 * len(dept_activity_mix)), margin=dict(l=0, r=0, t=20, b=0))
         st.plotly_chart(fig_heatmap, use_container_width=True)
 
         st.divider()
         st.subheader("Team Summary Table")
-        st.dataframe(team_summary, use_container_width=True)
+
+        totals_row = pd.DataFrame({
+            'TotalTimeSpentHours': [filtered_df['TotalTimeSpentHours'].sum().round(2)],
+            'HoursSpentPerWeek': [filtered_df['HoursSpentPerWeek'].mean().round(2)],
+            'TotalCases': [filtered_df['TotalCases'].sum()],
+            'UniqueMeetings': [filtered_df['UniqueMeetings'].sum()],
+            'UniqueCalls': [filtered_df['UniqueCalls'].sum()],
+            'EmailCount': [filtered_df['EmailCount'].sum()]
+        }, index=['TOTAL'])
+        team_summary_display = pd.concat([team_summary, totals_row])
+
+        st.dataframe(
+            team_summary_display.style.format({
+                'TotalTimeSpentHours': '{:.2f}',
+                'HoursSpentPerWeek': '{:.2f}'
+            }).apply(
+                lambda row: ['font-weight: bold; background-color: #f0f2f6'] * len(row) if row.name == 'TOTAL' else [''] * len(row),
+                axis=1
+            ),
+            use_container_width=True,
+            height=(len(team_summary_display) + 1) * 35 + 3
+        )
 
 # ============================================================================
 # TAB 3: INDIVIDUAL
@@ -974,66 +1144,178 @@ with tab3:
 
     if len(filtered_df) > 0:
         filtered_df['emp_label'] = filtered_df['EmployeeName'] + ' (' + filtered_df['TenureYears'].astype(str) + ' yrs)'
-        emp_labels = filtered_df['emp_label'].tolist()
+
+        col1, col2 = st.columns(2)
+        with col1:
+            indiv_dept_options = ["All Departments"] + sorted(filtered_df['Department'].unique().tolist())
+            indiv_dept = st.selectbox("Department", indiv_dept_options, key="indiv_dept_filter")
+
+        indiv_scope_df = filtered_df if indiv_dept == "All Departments" else filtered_df[filtered_df['Department'] == indiv_dept]
+        emp_labels = sorted(indiv_scope_df['emp_label'].tolist())
+
+        with col2:
+            if len(emp_labels) > 0:
+                selected_employee = st.selectbox("Select Employee", emp_labels, key="indiv_emp_filter")
 
         if len(emp_labels) > 0:
-            selected_employee = st.selectbox("Select Employee", emp_labels)
-
             selected_row = filtered_df[filtered_df['emp_label'] == selected_employee]
             if len(selected_row) > 0:
                 emp_data = selected_row.iloc[0]
+                # Databricks can return numeric fields as decimal.Decimal, which doesn't mix with
+                # float in arithmetic (raises TypeError) — normalize once for all downstream math.
+                for _col in emp_data.index:
+                    if isinstance(emp_data[_col], Decimal):
+                        emp_data[_col] = float(emp_data[_col])
 
                 # Employee info with capacity badge
-                col1, col2, col3, col4 = st.columns(4)
+                col1, col2, col3, col4, col5 = st.columns(5)
                 with col1:
                     with st.container(border=True):
                         st.metric("Total Hours", f"{emp_data['TotalTimeSpentHours']:.1f}h")
                 with col2:
                     with st.container(border=True):
-                        st.metric("Hours/Week", f"{emp_data['HoursSpentPerWeek']:.1f}h")
+                        st.metric(
+                            "Hours/Week",
+                            f"{emp_data['HoursSpentPerWeek']:.1f}h",
+                            help=f"{emp_data['HoursSpentPerWeek'] - group_avg_hours:+.1f}h vs {group_avg_hours:.1f}h group average"
+                        )
                 with col3:
                     with st.container(border=True):
                         st.metric("Title", emp_data.get('JobTitle', 'N/A'))
                 with col4:
                     with st.container(border=True):
                         st.metric("Tenure (Yrs)", f"{emp_data.get('TenureYears', 'N/A')}")
+                with col5:
+                    with st.container(border=True):
+                        capacity_emoji = {"Under": "🟡", "On Target": "🟢", "Over": "🔴"}.get(emp_data['CapacityStatus'], "")
+                        st.metric("Capacity", f"{capacity_emoji} {emp_data['CapacityStatus']}")
 
                 st.caption("ℹ️ Total Hours and Hours/Week include estimated time for Calls, Emails, and RPDs — see the Methodology tab for how each is calculated.")
 
+                col1, col2 = st.columns(2)
+                with col1:
+                    with st.container(border=True):
+                        st.metric("Accounts Covered", f"{emp_data.get('AccountsCovered', 0):,.0f}")
+                with col2:
+                    with st.container(border=True):
+                        st.metric("Users Covered", f"{emp_data.get('UsersCovered', 0):,.0f}")
+
+                if variance_pct > 0:
+                    tolerance = group_avg_hours * (variance_pct / 100)
+                    st.caption(f"Group average: {group_avg_hours:.1f} hrs/week | On-target range: {group_avg_hours - tolerance:.1f}–{group_avg_hours + tolerance:.1f} hrs/week (±{variance_pct}%)")
+                else:
+                    st.caption(f"Group average: {group_avg_hours:.1f} hrs/week | On-target range: exact match only (0% variance)")
+
                 st.divider()
 
-                # Capacity status
-                col1, col2 = st.columns([3, 1])
+                st.divider()
+
+                # Peer comparison vs department average
+                st.subheader("vs. Department Average")
+
+                dept_peer_df = filtered_df[filtered_df['Department'] == emp_data['Department']]
+                compare_metrics = {
+                    'Hours/Week': 'HoursSpentPerWeek',
+                    'Total Cases': 'TotalCases',
+                    'Meetings': 'UniqueMeetings',
+                    'Calls': 'UniqueCalls',
+                    'Emails': 'EmailCount',
+                    'Hit Rate %': 'HitRatePct',
+                    'Accounts Covered': 'AccountsCovered',
+                    'Users Covered': 'UsersCovered',
+                }
+
+                compare_rows = []
+                for label, col in compare_metrics.items():
+                    dept_avg = float(dept_peer_df[col].mean() or 0)
+                    emp_val = float(emp_data.get(col, 0) or 0)
+                    pct_of_avg = (emp_val / dept_avg * 100) if dept_avg else 0
+                    compare_rows.append({'Metric': label, 'PctOfAvg': pct_of_avg, 'EmpVal': emp_val, 'DeptAvg': dept_avg})
+                compare_df = pd.DataFrame(compare_rows).sort_values('Metric', ascending=False)
+
+                fig_compare = go.Figure()
+                fig_compare.add_trace(go.Bar(
+                    y=compare_df['Metric'],
+                    x=compare_df['PctOfAvg'],
+                    orientation='h',
+                    marker=dict(color=[STATUS['good'] if v >= 100 else STATUS['critical'] for v in compare_df['PctOfAvg']]),
+                    text=[f"{v:.0f}%" for v in compare_df['PctOfAvg']],
+                    textposition='auto',
+                    customdata=compare_df[['EmpVal', 'DeptAvg']].values,
+                    hovertemplate='<b>%{y}</b><br>%{x:.0f}% of dept avg<br>Employee: %{customdata[0]:.1f} | Dept Avg: %{customdata[1]:.1f}<extra></extra>'
+                ))
+                fig_compare.add_vline(x=100, line_dash='dash', line_color='gray')
+                fig_compare.update_layout(
+                    xaxis_title='% of Department Average (100% = dept avg)',
+                    yaxis_title='',
+                    height=350,
+                    margin=dict(l=0, r=0, t=10, b=0)
+                )
+                st.plotly_chart(fig_compare, use_container_width=True)
+
+                st.divider()
+
+                # Case & activity detail
+                st.subheader("Case & Activity Detail")
+                col1, col2, col3 = st.columns(3)
                 with col1:
-                    st.subheader(f"Capacity Status: {emp_data['CapacityStatus']}")
-                    if variance_pct > 0:
-                        tolerance = group_avg_hours * (variance_pct / 100)
-                        st.write(f"Group average: {group_avg_hours:.1f} hrs/week | On-target range: {group_avg_hours - tolerance:.1f}–{group_avg_hours + tolerance:.1f} hrs/week (±{variance_pct}%)")
-                    else:
-                        st.write(f"Group average: {group_avg_hours:.1f} hrs/week | Variance: 0% (exact match only)")
+                    with st.container(border=True):
+                        st.metric("Cases Created", f"{emp_data.get('CasesCreated', 0):,.0f}")
+                with col2:
+                    with st.container(border=True):
+                        st.metric("Cases Delegated", f"{emp_data.get('CasesDelegated', 0):,.0f}")
+                with col3:
+                    with st.container(border=True):
+                        st.metric("Cases Received", f"{emp_data.get('CasesReceived', 0):,.0f}")
+
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    with st.container(border=True):
+                        st.metric("Call Hit Rate", f"{emp_data.get('HitRatePct', 0):.1f}%")
+                with col2:
+                    with st.container(border=True):
+                        st.metric("Connections Made", f"{emp_data.get('ConnectionsMade', 0):,.0f}")
+                with col3:
+                    with st.container(border=True):
+                        st.metric("Unique Clients Met", f"{emp_data.get('UniqueClientsMetWith', 0):,.0f}")
 
                 st.divider()
 
                 # Activity breakdown
                 emp_activities = {
-                    'Cases': emp_data.get('TotalCaseHours', 0),
-                    'Meetings': emp_data.get('MeetingHours', 0),
-                    'Calls': emp_data.get('CallTimeSpentHours', 0),
-                    'Emails': emp_data.get('EmailHours', 0),
-                    'RPDs': emp_data.get('RPD_EstHours', 0)
+                    'Cases': float(emp_data.get('TotalCaseHours', 0) or 0),
+                    'Meetings': float(emp_data.get('MeetingHours', 0) or 0),
+                    'Calls': float(emp_data.get('CallTimeSpentHours', 0) or 0),
+                    'Emails': float(emp_data.get('EmailHours', 0) or 0),
+                    'RPDs': float(emp_data.get('RPD_EstHours', 0) or 0)
                 }
                 emp_activities = {k: v for k, v in emp_activities.items() if v > 0}
 
                 if emp_activities:
-                    colors_list = [ACTIVITY_COLORS.get(activity, '#999999') for activity in emp_activities.keys()]
-                    fig_emp_pie = go.Figure(data=[go.Pie(
-                        labels=list(emp_activities.keys()),
-                        values=list(emp_activities.values()),
-                        marker=dict(colors=colors_list)
+                    total_emp_activity_hours = sum(emp_activities.values())
+                    sorted_activities = sorted(emp_activities.items(), key=lambda x: x[1])
+                    labels = [k for k, v in sorted_activities]
+                    values = [v for k, v in sorted_activities]
+                    colors_sorted = [ACTIVITY_COLORS.get(l, '#999999') for l in labels]
+
+                    fig_emp_bar = go.Figure(data=[go.Bar(
+                        y=labels,
+                        x=values,
+                        orientation='h',
+                        marker=dict(color=colors_sorted),
+                        text=[f"{v:,.1f}h ({v / total_emp_activity_hours * 100:.0f}%)" for v in values],
+                        textposition='auto',
+                        hovertemplate='<b>%{y}</b><br>%{x:,.1f}h<extra></extra>'
                     )])
-                    fig_emp_pie.update_layout(title=f"Activity Breakdown", height=400)
+                    fig_emp_bar.update_layout(
+                        title="Activity Breakdown",
+                        xaxis_title="Hours",
+                        yaxis_title="",
+                        height=350,
+                        margin=dict(l=0, r=0, t=40, b=0)
+                    )
                     st.caption("ℹ️ Cases & Meetings hours are actual tracked time. Calls, Emails, and RPDs hours are estimates — see the Methodology tab.")
-                    st.plotly_chart(fig_emp_pie, use_container_width=True)
+                    st.plotly_chart(fig_emp_bar, use_container_width=True)
         else:
             st.info("No employees in selected department(s)")
     else:
@@ -1051,8 +1333,11 @@ with tab4:
     # Granularity selector
     col1, col2 = st.columns([1, 3])
     with col1:
-        granularity = st.radio("Granularity", ["Weekly", "Monthly"], horizontal=True)
-    granularity_key = "week" if granularity == "Weekly" else "month"
+        granularity = st.radio("Granularity", ["Weekly", "Monthly", "Quarterly"], horizontal=True, index=1)
+    granularity_key = {"Weekly": "week", "Monthly": "month", "Quarterly": "quarter"}[granularity]
+
+    if granularity == "Quarterly":
+        st.caption("ℹ️ Fiscal quarters: Q1 Sep–Nov, Q2 Dec–Feb, Q3 Mar–May, Q4 Jun–Aug")
 
     # Load trend data
     trend_df = load_trend_data(fy_start, fy_end, granularity_key)
@@ -1073,31 +1358,79 @@ with tab4:
     if trend_df is None or len(trend_df) == 0:
         st.warning("No trend data available for the current date range and Region/Department filter selection.")
     else:
-        # Section 1: Org-wide total
-        st.write("**Organization-wide Total Hours**")
+        # Trend summary widgets: period-over-period growth, trend direction, busiest period
+        org_totals = trend_df.groupby('Period').agg({
+            'TotalHours': 'sum',
+            'TotalCases': 'sum',
+            'UniqueMeetings': 'sum'
+        }).reset_index().sort_values('Period')
 
-        org_total = trend_df.groupby('Period')['TotalHours'].sum().reset_index()
+        def format_period_label(period):
+            if granularity_key == 'week':
+                return f"Week of {period.strftime('%b %d, %Y')}"
+            elif granularity_key == 'quarter':
+                quarter_map = {9: 1, 10: 1, 11: 1, 12: 2, 1: 2, 2: 2, 3: 3, 4: 3, 5: 3, 6: 4, 7: 4, 8: 4}
+                return f"FY Q{quarter_map.get(period.month, '?')} ({period.strftime('%b %Y')})"
+            return period.strftime('%b %Y')
 
-        fig_trend = go.Figure()
-        fig_trend.add_trace(go.Scatter(
-            x=org_total['Period'],
-            y=org_total['TotalHours'],
-            mode='lines+markers',
-            name='Total Hours',
-            line=dict(color=SEQUENTIAL_BLUE[3], width=2),
-            fill='tozeroy',
-            fillcolor=f'rgba({int(SEQUENTIAL_BLUE[3][1:3], 16)}, {int(SEQUENTIAL_BLUE[3][3:5], 16)}, {int(SEQUENTIAL_BLUE[3][5:7], 16)}, 0.1)',
-            hovertemplate='<b>%{x|%b %d, %Y}</b><br>Hours: %{y:.0f}<extra></extra>'
-        ))
+        def pct_change(new, old):
+            return ((new - old) / old * 100) if old else None
 
-        fig_trend.update_layout(
-            height=400,
-            hovermode='x unified',
-            xaxis_title='Period',
-            yaxis_title='Hours',
-            showlegend=False
-        )
-        st.plotly_chart(fig_trend, use_container_width=True)
+        st.write("**Trend Summary**")
+
+        if len(org_totals) >= 2:
+            latest = org_totals.iloc[-1]
+            prior = org_totals.iloc[-2]
+            hours_chg = pct_change(latest['TotalHours'], prior['TotalHours'])
+            cases_chg = pct_change(latest['TotalCases'], prior['TotalCases'])
+            meetings_chg = pct_change(latest['UniqueMeetings'], prior['UniqueMeetings'])
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                with st.container(border=True):
+                    st.metric(
+                        f"Hours — {format_period_label(latest['Period'])}",
+                        f"{latest['TotalHours']:,.0f}h",
+                        delta=f"{hours_chg:+.1f}% vs prior period" if hours_chg is not None else None
+                    )
+            with col2:
+                with st.container(border=True):
+                    st.metric(
+                        f"Cases — {format_period_label(latest['Period'])}",
+                        f"{latest['TotalCases']:,.0f}",
+                        delta=f"{cases_chg:+.1f}% vs prior period" if cases_chg is not None else None
+                    )
+            with col3:
+                with st.container(border=True):
+                    st.metric(
+                        f"Meetings — {format_period_label(latest['Period'])}",
+                        f"{latest['UniqueMeetings']:,.0f}",
+                        delta=f"{meetings_chg:+.1f}% vs prior period" if meetings_chg is not None else None
+                    )
+        else:
+            st.info("Need at least 2 periods of data to show period-over-period growth.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            with st.container(border=True):
+                if len(org_totals) >= 4:
+                    half = len(org_totals) // 2
+                    first_half_avg = org_totals.iloc[:half]['TotalHours'].mean()
+                    second_half_avg = org_totals.iloc[half:]['TotalHours'].mean()
+                    shift_pct = pct_change(second_half_avg, first_half_avg) or 0
+                    if shift_pct > 5:
+                        trend_label = "📈 Trending Up"
+                    elif shift_pct < -5:
+                        trend_label = "📉 Trending Down"
+                    else:
+                        trend_label = "➡️ Flat"
+                    st.metric("Trend Direction", trend_label, help=f"{shift_pct:+.1f}% — second half of range vs first half of range (Total Hours)")
+                else:
+                    st.metric("Trend Direction", "N/A", help="Need at least 4 periods to determine trend direction")
+        with col2:
+            with st.container(border=True):
+                peak_row = org_totals.loc[org_totals['TotalHours'].idxmax()]
+                st.metric("Busiest Period", format_period_label(peak_row['Period']), help=f"{peak_row['TotalHours']:,.0f}h — highest Total Hours in the selected range")
 
         st.divider()
 
@@ -1116,64 +1449,23 @@ with tab4:
 
         fig_stack = go.Figure()
         for activity, col_name in activity_hour_cols.items():
-            fig_stack.add_trace(go.Scatter(
+            fig_stack.add_trace(go.Bar(
                 x=activity_trend['Period'],
                 y=activity_trend[col_name],
-                mode='lines',
                 name=activity,
-                stackgroup='activity',
-                line=dict(color=ACTIVITY_COLORS.get(activity, '#999999'), width=1),
+                marker=dict(color=ACTIVITY_COLORS.get(activity, '#999999')),
                 hovertemplate=f'<b>{activity}</b><br>%{{x|%b %d, %Y}}: %{{y:.0f}}h<extra></extra>'
             ))
 
         fig_stack.update_layout(
             height=400,
+            barmode='stack',
             hovermode='x unified',
             xaxis_title='Period',
             yaxis_title='Hours',
             legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
         )
         st.plotly_chart(fig_stack, use_container_width=True)
-
-        st.divider()
-
-        # Section 3: Region breakdown
-        st.write("**Trends by Region**")
-
-        region_options = sorted(trend_df['Region'].dropna().unique())
-        region_default = [r for r in selected_regions if r in region_options] or region_options
-
-        region_filter = st.multiselect(
-            "Regions to display",
-            options=region_options,
-            default=region_default,
-            key="trend_region_filter"
-        )
-
-        if region_filter:
-            region_trend = trend_df[trend_df['Region'].isin(region_filter)]
-            region_agg = region_trend.groupby(['Period', 'Region'])['TotalHours'].sum().reset_index()
-
-            fig_region = go.Figure()
-            for i, region in enumerate(region_filter):
-                region_data = region_agg[region_agg['Region'] == region].sort_values('Period')
-                fig_region.add_trace(go.Scatter(
-                    x=region_data['Period'],
-                    y=region_data['TotalHours'],
-                    mode='lines+markers',
-                    name=region,
-                    line=dict(color=CATEGORICAL[i % len(CATEGORICAL)], width=2),
-                    hovertemplate='<b>%{x|%b %d, %Y}</b><br>%{fullData.name}: %{y:.0f}h<extra></extra>'
-                ))
-
-            fig_region.update_layout(
-                height=400,
-                hovermode='x unified',
-                xaxis_title='Period',
-                yaxis_title='Hours',
-                legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01)
-            )
-            st.plotly_chart(fig_region, use_container_width=True)
 
         st.divider()
 
@@ -1201,17 +1493,17 @@ with tab4:
 
             for i, dept in enumerate(dept_filter):
                 dept_data = dept_trend[dept_trend['Department'] == dept].sort_values('Period')
-                fig_dept.add_trace(go.Scatter(
+                fig_dept.add_trace(go.Bar(
                     x=dept_data['Period'],
                     y=dept_data['TotalHours'],
-                    mode='lines+markers',
                     name=dept,
-                    line=dict(color=CATEGORICAL[i % len(CATEGORICAL)], width=2),
+                    marker=dict(color=CATEGORICAL[i % len(CATEGORICAL)]),
                     hovertemplate='<b>%{x|%b %d, %Y}</b><br>%{fullData.name}: %{y:.0f}h<extra></extra>'
                 ))
 
             fig_dept.update_layout(
                 height=400,
+                barmode='group',
                 hovermode='x unified',
                 xaxis_title='Period',
                 yaxis_title='Hours',
